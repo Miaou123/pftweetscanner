@@ -150,17 +150,25 @@ class TelegramPublisher {
         header += `<code>${address}</code>\n`;
         
         if (twitterMetrics) {
-            const likesText = twitterMetrics.likes > 0 ? `${this.formatNumber(twitterMetrics.likes)} likes` : '';
-            const retweetsText = twitterMetrics.retweets > 0 ? `${this.formatNumber(twitterMetrics.retweets)} RT` : '';
+            const engagementParts = [];
             
-            if (likesText || retweetsText) {
-                const parts = [likesText, retweetsText].filter(Boolean);
-                header += `🐦 Twitter: ${parts.join(' | ')}`;
+            // Add views if available (priority display)
+            if (twitterMetrics.views && twitterMetrics.views > 0) {
+                engagementParts.push(`👀 ${this.formatNumber(twitterMetrics.views)} views`);
+            }
+            
+            // Add likes (always show if > 0)
+            if (twitterMetrics.likes && twitterMetrics.likes > 0) {
+                engagementParts.push(`❤️ ${this.formatNumber(twitterMetrics.likes)} likes`);
+            }
+            
+            if (engagementParts.length > 0) {
+                header += `🐦 ${engagementParts.join(' • ')}`;
                 
-                // Include publishing date
+                // Add time if available
                 if (twitterMetrics.publishedAt) {
                     const timeAgo = this.formatTimeAgo(twitterMetrics.publishedAt);
-                    header += ` • ${timeAgo}`;
+                    header += ` • 📅 ${timeAgo}`;
                 }
                 header += '\n';
             }
@@ -168,6 +176,23 @@ class TelegramPublisher {
         
         return header + '\n';
     }
+
+    formatNumber(num) {
+    if (num === null || num === undefined || isNaN(num)) {
+        return '0';
+    }
+    
+    const absNum = Math.abs(num);
+    
+    if (absNum >= 1000000) {
+        return (num / 1000000).toFixed(1) + 'M';
+    }
+    if (absNum >= 1000) {
+        return (num / 1000).toFixed(1) + 'K';
+    }
+    
+    return Math.round(num).toLocaleString();
+}
 
     formatBundleAnalysis(result) {
         if (!result) return '';

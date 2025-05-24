@@ -50,10 +50,10 @@ class TelegramPublisher {
     }
 
     formatAnalysisMessage(analysisResult) {
-        const { tokenInfo, twitterMetrics, summary, analyses, operationId } = analysisResult;
+        const { tokenInfo, twitterMetrics, analyses, operationId } = analysisResult;
         
         // Header with token info
-        let message = this.formatHeader(tokenInfo, twitterMetrics, summary);
+        let message = this.formatHeader(tokenInfo, twitterMetrics);
         
         // Bundle analysis results
         if (analyses.bundle && analyses.bundle.success) {
@@ -71,13 +71,12 @@ class TelegramPublisher {
         return message;
     }
 
-    formatHeader(tokenInfo, twitterMetrics, summary) {
-        const riskEmoji = this.getRiskEmoji(summary.riskLevel);
+    formatHeader(tokenInfo, twitterMetrics) {
         const symbol = tokenInfo.symbol || 'Unknown';
         const name = tokenInfo.name || 'Unknown Token';
+        const eventType = tokenInfo.eventType === 'migration' ? '🔄 MIGRATION' : '🆕 NEW TOKEN';
         
-        let header = `${riskEmoji} <b>${symbol}</b> | ${name}\n`;
-        header += `📊 Risk Level: <b>${summary.riskLevel}</b> (${Math.round(summary.overallScore)}/100)\n`;
+        let header = `${eventType} | <b>${symbol}</b> | ${name}\n`;
         
         if (twitterMetrics) {
             const likesText = twitterMetrics.likes > 0 ? `${formatNumber(twitterMetrics.likes)} likes` : '';
@@ -85,7 +84,14 @@ class TelegramPublisher {
             
             if (likesText || retweetsText) {
                 const parts = [likesText, retweetsText].filter(Boolean);
-                header += `🐦 Twitter: ${parts.join(' | ')}\n`;
+                header += `🐦 Twitter: ${parts.join(' | ')}`;
+                
+                // Include publishing date
+                if (twitterMetrics.publishedAt) {
+                    const timeAgo = this.formatTimeAgo(twitterMetrics.publishedAt);
+                    header += ` • ${timeAgo}`;
+                }
+                header += '\n';
             }
         }
         
@@ -95,60 +101,87 @@ class TelegramPublisher {
     formatBundleAnalysis(result) {
         if (!result) return '';
         
-        let section = '📦 <b>Bundle Analysis:</b>\n';
+        let section = '\n<b>Bundle Analysis:</b>\n';
         
         if (result.bundleDetected) {
-            section += `🔴 Bundle detected: ${result.percentageBundled?.toFixed(2)}% of supply\n`;
-            section += `💰 ${formatNumber(result.totalTokensBundled)} tokens bundled\n`;
-            section += `💎 ${result.totalSolSpent?.toFixed(2)} SOL spent\n\n`;
+            // Count total transactions across all bundles
+            const totalTransactions = result.bundles.reduce((sum, bundle) => sum + bundle.transactions.length, 0);
+            const totalBoughtPercentage = result.percentageBundled || 0;
             
-            // Add condensed bundle summary
-            section += this.formatCondensedBundleSummary(result);
+            // Use the ACTUAL calculated holding percentage
+            const currentlyHeldPercentage = result.totalHoldingAmountPercentage || 0;
+            
+            section += `📦 Total Bundles: ${result.bundles.length}\n`;
+            section += `🪙 Total Tokens Bundled: ${this.formatLargeNumber(result.totalTokensBundled)} ${result.tokenInfo?.symbol || 'tokens'} (${totalBoughtPercentage.toFixed(2)}%)\n`;
+            section += `🔒 Total Holding Amount: ${this.formatLargeNumber(result.totalHoldingAmount)} ${result.tokenInfo?.symbol || 'tokens'} (${currentlyHeldPercentage.toFixed(2)}%)\n`;
+            
+            // Get top 5 wallets by holding amount
+            const topWallets = this.getTopWalletsByHolding(result.bundles);
+            
+            if (topWallets.length > 0) {
+                section += `Top ${Math.min(5, topWallets.length)} wallets: `;
+                const walletLinks = topWallets.slice(0, 5).map(([wallet, holdingAmount]) => {
+                    const shortWallet = `${wallet.substring(0, 5)}...${wallet.substring(wallet.length - 4)}`;
+                    return `<a href="https://solscan.io/account/${wallet}">${shortWallet}</a>`;
+                });
+                section += walletLinks.join(', ');
+            }
+            
+            section += '\n\n';
         } else {
-            section += '✅ No significant bundling detected\n';
+            section += '✅ No significant bundling detected\n\n';
         }
         
         return section;
     }
 
-    formatCondensedBundleSummary(result) {
-        const totalTransactions = result.bundles.reduce((sum, bundle) => sum + bundle.transactions.length, 0);
-        const totalBoughtPercentage = result.percentageBundled || 0;
+    formatLargeNumber(num) {
+        if (!num || isNaN(num)) return '0';
         
-        // For now, assume currently held is same as bought (we'd need current balance data to be accurate)
-        const currentlyHeldPercentage = totalBoughtPercentage; // This would need actual current balance checking
+        if (num >= 1000000000) {
+            return (num / 1000000000).toFixed(1) + 'B';
+        }
+        if (num >= 1000000) {
+            return (num / 1000000).toFixed(1) + 'M';
+        }
+        if (num >= 1000) {
+            return (num / 1000).toFixed(1) + 'K';
+        }
         
-        // Get top 5 bundle holders (by tokens bought in bundles)
-        const allBundleWallets = new Map();
+        return Math.round(num).toString();
+    }
+
+    getTopWalletsByHolding(bundles) {
+        // Create a map of all wallets and their total holdings across all bundles
+        const walletHoldings = new Map();
         
-        result.bundles.forEach(bundle => {
-            bundle.transactions.forEach(tx => {
-                const wallet = tx.user;
-                const tokens = tx.token_amount / 1000000; // Convert from raw to tokens
-                allBundleWallets.set(wallet, (allBundleWallets.get(wallet) || 0) + tokens);
+        bundles.forEach(bundle => {
+            bundle.uniqueWallets.forEach(wallet => {
+                // For each wallet, we need to get their total holding amount
+                // Since bundles might share wallets, we need to avoid double counting
+                if (!walletHoldings.has(wallet)) {
+                    // Find the wallet's total holding from bundle data
+                    let walletTotalHolding = 0;
+                    bundles.forEach(b => {
+                        if (b.uniqueWallets.includes(wallet)) {
+                            // Calculate wallet's proportion of this bundle's holding
+                            const walletProportion = 1 / b.uniqueWalletsCount; // Simple equal split assumption
+                            walletTotalHolding += (b.holdingAmount || 0) * walletProportion;
+                        }
+                    });
+                    walletHoldings.set(wallet, walletTotalHolding);
+                }
             });
         });
         
-        // Sort by tokens held and get top 5
-        const topHolders = Array.from(allBundleWallets.entries())
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5);
-        
-        let summary = `<b>Bundle Summary:</b>\n`;
-        summary += `Total Bundle Transactions: ${totalTransactions}\n`;
-        summary += `Total Bought: ${totalBoughtPercentage.toFixed(2)}%\n`;
-        summary += `Currently Held: ${currentlyHeldPercentage.toFixed(2)}%\n`;
-        
-        if (topHolders.length > 0) {
-            summary += `Top 5 addresses: `;
-            const addressLinks = topHolders.map(([wallet, tokens]) => {
-                const shortWallet = `${wallet.substring(0, 5)}...${wallet.substring(wallet.length - 4)}`;
-                return `<a href="https://solscan.io/account/${wallet}">${shortWallet}</a>`;
-            });
-            summary += addressLinks.join(', ');
-        }
-        
-        return summary + '\n';
+        // Sort by holding amount and return as array of [wallet, amount] pairs
+        return Array.from(walletHoldings.entries())
+            .sort((a, b) => b[1] - a[1]);
+    }
+
+    getTopBundleHolders(bundles) {
+        // This method is now replaced by getTopWalletsByHolding but kept for compatibility
+        return this.getTopWalletsByHolding(bundles);
     }
 
     formatFooter(tokenAddress, operationId, twitterLink) {
@@ -162,7 +195,36 @@ class TelegramPublisher {
         return footer;
     }
 
+    formatTimeAgo(isoDate) {
+        if (!isoDate) return '';
+        
+        try {
+            const now = new Date();
+            const published = new Date(isoDate);
+            const diffMs = now - published;
+            const diffMins = Math.floor(diffMs / (1000 * 60));
+            const diffHours = Math.floor(diffMins / 60);
+            const diffDays = Math.floor(diffHours / 24);
+            
+            if (diffMins < 1) {
+                return 'now';
+            } else if (diffMins < 60) {
+                return `${diffMins}m ago`;
+            } else if (diffHours < 24) {
+                return `${diffHours}h ago`;
+            } else if (diffDays < 7) {
+                return `${diffDays}d ago`;
+            } else {
+                return published.toLocaleDateString();
+            }
+        } catch (error) {
+            logger.debug('Error formatting time ago:', error);
+            return '';
+        }
+    }
+
     getRiskEmoji(riskLevel) {
+        // Method kept for compatibility but not used in clean format
         switch (riskLevel) {
             case 'LOW': return '🟢';
             case 'MEDIUM': return '🟡';

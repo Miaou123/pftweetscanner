@@ -1,4 +1,4 @@
-// src/services/websocketManager.js
+// src/services/websocketManager.js - Unified WebSocket Manager (Both Creation & Migration)
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
@@ -81,6 +81,7 @@ class WebSocketManager extends EventEmitter {
                 
                 // Transform the message to match expected format
                 const tokenEvent = {
+                    eventType: 'creation',
                     mint: message.mint,
                     name: message.name,
                     symbol: message.symbol,
@@ -100,18 +101,89 @@ class WebSocketManager extends EventEmitter {
                 };
                 
                 this.emit('newToken', tokenEvent);
-            } else if (message.signature && !message.txType) {
-                // This might be a trade or other event
-                logger.debug(`[${this.connectionId}] 💱 Possible trade event: ${message.signature.substring(0, 8)}...`);
-                this.emit('tokenTrade', message);
+            }
+            // Check if this is a migration event
+            else if (message.txType === 'migration' || 
+                message.type === 'migration' || 
+                (message.signature && message.mint && this.isMigrationEvent(message))) {
+                
+                logger.info(`[${this.connectionId}] 🔄 MIGRATION: Token ${message.mint} - Signature: ${message.signature}`);
+                logger.debug(`[${this.connectionId}] Migration details:`, {
+                    mint: message.mint,
+                    signature: message.signature,
+                    pool: message.pool,
+                    timestamp: message.timestamp,
+                    allFields: Object.keys(message)
+                });
+                
+                // Transform migration event
+                const migrationEvent = {
+                    eventType: 'migration',
+                    mint: message.mint,
+                    signature: message.signature,
+                    pool: message.pool,
+                    timestamp: Date.now(),
+                    // Migration events may not have name/symbol immediately
+                    // We'll need to fetch this data separately
+                    name: message.name || null,
+                    symbol: message.symbol || null,
+                    uri: message.uri || null,
+                    // Migration-specific data
+                    migrationData: {
+                        newPool: message.pool,
+                        liquidityAdded: message.liquidityAdded,
+                        migrationTimestamp: message.timestamp,
+                        migrationTx: message.signature
+                    },
+                    // Include any other fields that might be useful
+                    rawData: message
+                };
+                
+                this.emit('tokenMigration', migrationEvent);
+            }
+            // Log other message types for debugging
+            else if (message.signature && message.mint) {
+                logger.debug(`[${this.connectionId}] 🔍 Other event with mint: ${message.mint.substring(0, 8)}... | Type: ${message.txType || 'unknown'} | Fields: ${Object.keys(message).join(', ')}`);
+                
+                // Sometimes migrations might not be clearly marked, look for patterns
+                if (this.couldBeMigration(message)) {
+                    logger.info(`[${this.connectionId}] 🤔 Possible migration event: ${message.mint}`);
+                    logger.debug(`[${this.connectionId}] Possible migration data:`, message);
+                }
             } else {
                 // Log any other message types we might be missing
-                logger.debug(`[${this.connectionId}] ❓ Unknown message:`, Object.keys(message));
+                logger.debug(`[${this.connectionId}] ❓ Unknown message type: ${Object.keys(message).join(', ')}`);
             }
         } catch (error) {
             logger.error(`[${this.connectionId}] Error parsing WebSocket message:`, error);
             logger.debug('Raw message data:', data.toString().substring(0, 500) + '...');
         }
+    }
+
+    // Helper method to identify migration events
+    isMigrationEvent(message) {
+        // Look for migration-specific patterns
+        const migrationIndicators = [
+            message.pool && message.pool !== message.mint, // Has a different pool address
+            message.liquidityAdded,
+            message.migration === true,
+            message.migrated === true,
+            message.graduated === true,
+            // Add more patterns as we discover them
+        ];
+        
+        return migrationIndicators.some(indicator => indicator);
+    }
+
+    // Helper method for potential migrations that aren't clearly marked
+    couldBeMigration(message) {
+        // Look for patterns that might indicate migration
+        return (
+            message.pool && 
+            message.pool !== message.mint &&
+            message.signature &&
+            !message.txType // Sometimes migrations don't have txType set
+        );
     }
 
     handleError(error) {
@@ -188,50 +260,12 @@ class WebSocketManager extends EventEmitter {
         }
     }
 
-    // Subscription methods
+    // Subscription methods for both creation and migration events
     subscribeNewToken() {
         const subscription = { method: 'subscribeNewToken' };
         if (this.send(subscription)) {
             this.subscriptions.add(subscription);
-            logger.info(`[${this.connectionId}] Subscribed to new token events`);
-            return true;
-        }
-        return false;
-    }
-
-    subscribeTokenTrade(tokenAddresses) {
-        if (!Array.isArray(tokenAddresses) || tokenAddresses.length === 0) {
-            logger.warn('Invalid token addresses for subscription');
-            return false;
-        }
-
-        const subscription = { 
-            method: 'subscribeTokenTrade', 
-            keys: tokenAddresses 
-        };
-        
-        if (this.send(subscription)) {
-            this.subscriptions.add(subscription);
-            logger.info(`[${this.connectionId}] Subscribed to token trades for ${tokenAddresses.length} tokens`);
-            return true;
-        }
-        return false;
-    }
-
-    subscribeAccountTrade(accountAddresses) {
-        if (!Array.isArray(accountAddresses) || accountAddresses.length === 0) {
-            logger.warn('Invalid account addresses for subscription');
-            return false;
-        }
-
-        const subscription = { 
-            method: 'subscribeAccountTrade', 
-            keys: accountAddresses 
-        };
-        
-        if (this.send(subscription)) {
-            this.subscriptions.add(subscription);
-            logger.info(`[${this.connectionId}] Subscribed to account trades for ${accountAddresses.length} accounts`);
+            logger.info(`[${this.connectionId}] ✅ Subscribed to new token events`);
             return true;
         }
         return false;
@@ -241,7 +275,7 @@ class WebSocketManager extends EventEmitter {
         const subscription = { method: 'subscribeMigration' };
         if (this.send(subscription)) {
             this.subscriptions.add(subscription);
-            logger.info(`[${this.connectionId}] Subscribed to migration events`);
+            logger.info(`[${this.connectionId}] ✅ Subscribed to migration events`);
             return true;
         }
         return false;
@@ -273,6 +307,7 @@ class WebSocketManager extends EventEmitter {
             isConnected: this.isConnected,
             reconnectAttempts: this.reconnectAttempts,
             subscriptionsCount: this.subscriptions.size,
+            subscriptionType: 'migration-only',
             readyState: this.ws ? this.ws.readyState : 'Not initialized'
         };
     }

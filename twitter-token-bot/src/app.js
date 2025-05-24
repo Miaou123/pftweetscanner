@@ -1,11 +1,15 @@
-// src/app.js - Main PumpFun Token Monitoring Application
+// src/app.js - Unified PumpFun Monitoring Application
 const WebSocketManager = require('./services/websocketManager');
 const TokenDeploymentMonitor = require('./monitors/tokenDeploymentMonitor');
+const MigrationMonitor = require('./monitors/migrationMonitor');
 const logger = require('./utils/logger');
 const config = require('./config/monitoringConfig');
 
-class PumpFunMonitoringApp {
+class PumpFunUnifiedApp {
     constructor(appConfig = {}) {
+        // Determine bot mode from environment or config
+        this.botMode = process.env.BOT_MODE || appConfig.botMode || 'both';
+        
         this.config = {
             // WebSocket configuration
             websocket: {
@@ -15,28 +19,40 @@ class PumpFunMonitoringApp {
                 ...appConfig.websocket
             },
             
-            // Monitoring configuration
-            monitoring: {
-                minTwitterViews: 100000,
-                analysisTimeout: 5 * 60 * 1000, // 5 minutes
-                maxConcurrentAnalyses: 3,
-                processingDelay: 2000,
-                enabledAnalyses: ['bundle', 'topHolders', 'devAnalysis', 'teamSupply', 'freshWallets'],
-                ...appConfig.monitoring
+            // Creation Bot Configuration
+            creation: {
+                minTwitterViews: parseInt(process.env.CREATION_MIN_TWITTER_VIEWS) || 100000,
+                minTwitterLikes: parseInt(process.env.CREATION_MIN_TWITTER_LIKES) || 100,
+                analysisTimeout: parseInt(process.env.CREATION_ANALYSIS_TIMEOUT) || 5 * 60 * 1000,
+                maxConcurrentAnalyses: parseInt(process.env.MAX_CONCURRENT_ANALYSES) || 3,
+                processingDelay: parseInt(process.env.PROCESSING_DELAY) || 2000,
+                telegram: {
+                    botToken: process.env.TELEGRAM_BOT_TOKEN,
+                    channels: [process.env.CREATION_TELEGRAM_CHANNEL_ID || process.env.TELEGRAM_CHANNEL_ID].filter(Boolean),
+                },
+                enabledAnalyses: ['bundle'],
+                ...appConfig.creation
             },
             
-            // Telegram configuration
-            telegram: {
-                botToken: process.env.TELEGRAM_BOT_TOKEN,
-                channels: [process.env.TELEGRAM_CHANNEL_ID].filter(Boolean),
-                enablePreviews: true,
-                ...appConfig.telegram
+            // Migration Bot Configuration
+            migration: {
+                minTwitterViews: parseInt(process.env.MIGRATION_MIN_TWITTER_VIEWS) || 50000,
+                minTwitterLikes: parseInt(process.env.MIGRATION_MIN_TWITTER_LIKES) || 1,
+                analysisTimeout: parseInt(process.env.MIGRATION_ANALYSIS_TIMEOUT) || 10 * 60 * 1000,
+                maxConcurrentAnalyses: parseInt(process.env.MAX_CONCURRENT_ANALYSES) || 5,
+                processingDelay: parseInt(process.env.PROCESSING_DELAY) || 1000,
+                telegram: {
+                    botToken: process.env.TELEGRAM_BOT_TOKEN,
+                    channels: [process.env.MIGRATION_TELEGRAM_CHANNEL_ID].filter(Boolean),
+                },
+                enabledAnalyses: ['bundle'],
+                ...appConfig.migration
             },
             
             // Application settings
             app: {
                 enableHealthCheck: true,
-                healthCheckInterval: 60000, // 1 minute
+                healthCheckInterval: 60000,
                 enableMetrics: true,
                 gracefulShutdownTimeout: 30000,
                 ...appConfig.app
@@ -45,11 +61,13 @@ class PumpFunMonitoringApp {
 
         // Initialize components
         this.wsManager = null;
-        this.tokenMonitor = null;
+        this.creationMonitor = null;
+        this.migrationMonitor = null;
         this.isRunning = false;
         this.startTime = null;
         this.metrics = {
             tokensProcessed: 0,
+            migrationsProcessed: 0,
             analysesCompleted: 0,
             analysesPublished: 0,
             errors: 0,
@@ -60,6 +78,7 @@ class PumpFunMonitoringApp {
         this.start = this.start.bind(this);
         this.stop = this.stop.bind(this);
         this.handleNewToken = this.handleNewToken.bind(this);
+        this.handleTokenMigration = this.handleTokenMigration.bind(this);
         this.handleAnalysisCompleted = this.handleAnalysisCompleted.bind(this);
         this.handleError = this.handleError.bind(this);
         this.handleShutdown = this.handleShutdown.bind(this);
@@ -75,7 +94,8 @@ class PumpFunMonitoringApp {
         }
 
         try {
-            logger.info('🚀 Starting PumpFun Token Monitoring Application...');
+            logger.info('🚀 Starting PumpFun Unified Monitoring Application...');
+            logger.info(`📊 Bot Mode: ${this.botMode.toUpperCase()}`);
             this.startTime = Date.now();
 
             // Validate configuration
@@ -84,8 +104,8 @@ class PumpFunMonitoringApp {
             // Initialize WebSocket manager
             await this.initializeWebSocket();
 
-            // Initialize token deployment monitor
-            await this.initializeTokenMonitor();
+            // Initialize monitors based on mode
+            await this.initializeMonitors();
 
             // Start health check if enabled
             if (this.config.app.enableHealthCheck) {
@@ -121,16 +141,23 @@ class PumpFunMonitoringApp {
             throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
         }
 
+        // Validate bot mode
+        if (!['creation', 'migration', 'both'].includes(this.botMode)) {
+            throw new Error(`Invalid BOT_MODE: ${this.botMode}. Must be 'creation', 'migration', or 'both'`);
+        }
+
         // Validate Twitter configuration
         if (!process.env.TWITTER_BEARER_TOKEN && !process.env.X_BEARER_TOKEN) {
             logger.warn('⚠️ No Twitter API credentials found - engagement validation may be limited');
         }
 
-        // Validate Telegram configuration
-        if (!this.config.telegram.botToken) {
-            logger.warn('⚠️ No Telegram bot token - publishing disabled');
-        } else if (this.config.telegram.channels.length === 0) {
-            logger.warn('⚠️ No Telegram channels configured - results will not be published');
+        // Validate Telegram configuration based on mode
+        if (this.shouldRunCreation() && this.config.creation.telegram.channels.length === 0) {
+            logger.warn('⚠️ No creation Telegram channels configured');
+        }
+        
+        if (this.shouldRunMigration() && this.config.migration.telegram.channels.length === 0) {
+            logger.warn('⚠️ No migration Telegram channels configured');
         }
 
         logger.info('✅ Configuration validation completed');
@@ -144,8 +171,14 @@ class PumpFunMonitoringApp {
         // Setup event listeners
         this.wsManager.on('connected', () => {
             logger.info('✅ WebSocket connected successfully');
-            // Subscribe to new token events
-            this.wsManager.subscribeNewToken();
+            
+            // Subscribe based on bot mode
+            if (this.shouldRunCreation()) {
+                this.wsManager.subscribeNewToken();
+            }
+            if (this.shouldRunMigration()) {
+                this.wsManager.subscribeMigration();
+            }
         });
 
         this.wsManager.on('disconnected', ({ code, reason }) => {
@@ -153,7 +186,14 @@ class PumpFunMonitoringApp {
             this.metrics.errors++;
         });
 
-        this.wsManager.on('newToken', this.handleNewToken);
+        // Setup event handlers based on mode
+        if (this.shouldRunCreation()) {
+            this.wsManager.on('newToken', this.handleNewToken);
+        }
+        if (this.shouldRunMigration()) {
+            this.wsManager.on('tokenMigration', this.handleTokenMigration);
+        }
+        
         this.wsManager.on('error', this.handleError);
         
         this.wsManager.on('maxReconnectAttemptsReached', () => {
@@ -165,25 +205,51 @@ class PumpFunMonitoringApp {
         await this.wsManager.connect();
     }
 
-    async initializeTokenMonitor() {
-        logger.info('📊 Initializing token deployment monitor...');
+    async initializeMonitors() {
+        logger.info('📊 Initializing monitors...');
         
-        this.tokenMonitor = new TokenDeploymentMonitor(this.config.monitoring);
+        // Initialize Creation Monitor
+        if (this.shouldRunCreation()) {
+            logger.info('🆕 Initializing Creation Monitor...');
+            this.creationMonitor = new TokenDeploymentMonitor(this.config.creation);
+            this.creationMonitor.on('analysisCompleted', (data) => {
+                this.handleAnalysisCompleted({ ...data, source: 'creation' });
+            });
+            this.creationMonitor.on('error', this.handleError);
+            logger.info('✅ Creation Monitor initialized');
+        }
         
-        // Setup event listeners
-        this.tokenMonitor.on('analysisCompleted', this.handleAnalysisCompleted);
-        this.tokenMonitor.on('error', this.handleError);
+        // Initialize Migration Monitor
+        if (this.shouldRunMigration()) {
+            logger.info('🔄 Initializing Migration Monitor...');
+            this.migrationMonitor = new MigrationMonitor(this.config.migration);
+            this.migrationMonitor.on('analysisCompleted', (data) => {
+                this.handleAnalysisCompleted({ ...data, source: 'migration' });
+            });
+            this.migrationMonitor.on('error', this.handleError);
+            logger.info('✅ Migration Monitor initialized');
+        }
+    }
 
-        logger.info('✅ Token monitor initialized');
+    shouldRunCreation() {
+        return this.botMode === 'creation' || this.botMode === 'both';
+    }
+
+    shouldRunMigration() {
+        return this.botMode === 'migration' || this.botMode === 'both';
     }
 
     handleNewToken(tokenEvent) {
+        if (!this.shouldRunCreation() || !this.creationMonitor) {
+            return;
+        }
+
         try {
             this.metrics.tokensProcessed++;
             logger.debug(`📥 New token received: ${tokenEvent.symbol} (${tokenEvent.mint})`);
             
-            // Process the token through the monitor
-            this.tokenMonitor.processNewToken(tokenEvent);
+            // Process the token through the creation monitor
+            this.creationMonitor.processNewToken(tokenEvent);
             
         } catch (error) {
             logger.error('Error handling new token:', error);
@@ -191,22 +257,42 @@ class PumpFunMonitoringApp {
         }
     }
 
-    handleAnalysisCompleted({ tokenEvent, twitterMetrics, analysisResult, operationId }) {
+    handleTokenMigration(migrationEvent) {
+        if (!this.shouldRunMigration() || !this.migrationMonitor) {
+            return;
+        }
+
+        try {
+            this.metrics.migrationsProcessed++;
+            logger.info(`📥 Migration received: ${migrationEvent.mint}`);
+            logger.debug(`Migration details:`, migrationEvent);
+            
+            // Process the migration through the migration monitor
+            this.migrationMonitor.processTokenMigration(migrationEvent);
+            
+        } catch (error) {
+            logger.error('Error handling token migration:', error);
+            this.metrics.errors++;
+        }
+    }
+
+    handleAnalysisCompleted({ tokenEvent, twitterMetrics, analysisResult, operationId, source }) {
         try {
             this.metrics.analysesCompleted++;
             
             if (analysisResult.success) {
                 this.metrics.analysesPublished++;
-                logger.info(`✅ Analysis completed and published for ${tokenEvent.symbol}`);
+                const eventType = source === 'migration' ? 'migration' : 'creation';
+                logger.info(`✅ Analysis completed and published for ${tokenEvent.symbol} (${eventType})`);
             } else {
                 logger.warn(`⚠️ Analysis completed with limited success for ${tokenEvent.symbol}`);
             }
 
-            // Log summary
+            // Log summary with source indicator
             const duration = analysisResult.duration ? `${Math.round(analysisResult.duration / 1000)}s` : 'unknown';
-            const riskLevel = analysisResult.summary?.riskLevel || 'unknown';
+            const eventEmoji = source === 'migration' ? '🔄' : '🆕';
             
-            logger.info(`📈 ${tokenEvent.symbol}: Risk=${riskLevel}, Duration=${duration}, Twitter=${twitterMetrics.views} views`);
+            logger.info(`📈 ${eventEmoji} ${tokenEvent.symbol} (${source}): Duration=${duration}, Twitter=${twitterMetrics.views} views`);
             
         } catch (error) {
             logger.error('Error handling analysis completion:', error);
@@ -239,14 +325,32 @@ class PumpFunMonitoringApp {
     handleCriticalError(message) {
         logger.error(`🚨 Critical error detected: ${message}`);
         
-        // Try to send alert if Telegram is configured
-        if (this.tokenMonitor?.telegramPublisher) {
-            this.tokenMonitor.telegramPublisher.publishSimpleAlert(
-                { symbol: 'SYSTEM' },
-                `🚨 Critical Error: ${message}\n\nApplication may need manual intervention.`,
-                'high'
-            ).catch(err => logger.error('Failed to send critical error alert:', err));
+        // Try to send alert to both channels if configured
+        const alertPromises = [];
+        
+        if (this.creationMonitor?.telegramPublisher) {
+            alertPromises.push(
+                this.creationMonitor.telegramPublisher.publishSimpleAlert(
+                    { symbol: 'SYSTEM' },
+                    `🚨 Critical Error (Creation Bot): ${message}`,
+                    'high'
+                )
+            );
         }
+        
+        if (this.migrationMonitor?.telegramPublisher) {
+            alertPromises.push(
+                this.migrationMonitor.telegramPublisher.publishSimpleAlert(
+                    { symbol: 'SYSTEM' },
+                    `🚨 Critical Error (Migration Bot): ${message}`,
+                    'high'
+                )
+            );
+        }
+        
+        Promise.allSettled(alertPromises).catch(err => 
+            logger.error('Failed to send critical error alerts:', err)
+        );
     }
 
     startHealthCheck() {
@@ -261,16 +365,19 @@ class PumpFunMonitoringApp {
         const health = {
             timestamp: new Date().toISOString(),
             uptime: Date.now() - this.startTime,
+            mode: this.botMode,
             websocket: this.wsManager?.getConnectionInfo() || {},
-            monitor: this.tokenMonitor?.getStatus() || {},
+            creationMonitor: this.creationMonitor?.getStatus() || null,
+            migrationMonitor: this.migrationMonitor?.getStatus() || null,
             metrics: this.getMetrics(),
             memory: process.memoryUsage(),
             errors: this.metrics.errors
         };
 
         // Log health status periodically
-        if (this.metrics.tokensProcessed % 100 === 0 && this.metrics.tokensProcessed > 0) {
-            logger.info(`💓 Health Check - Uptime: ${Math.round(health.uptime / 1000 / 60)}min, Tokens: ${this.metrics.tokensProcessed}, Analyses: ${this.metrics.analysesCompleted}`);
+        const totalEvents = this.metrics.tokensProcessed + this.metrics.migrationsProcessed;
+        if (totalEvents % 50 === 0 && totalEvents > 0) {
+            logger.info(`💓 Health Check - Mode: ${this.botMode}, Uptime: ${Math.round(health.uptime / 1000 / 60)}min, Tokens: ${this.metrics.tokensProcessed}, Migrations: ${this.metrics.migrationsProcessed}, Analyses: ${this.metrics.analysesCompleted}`);
         }
 
         // Check for warning conditions
@@ -296,9 +403,12 @@ class PumpFunMonitoringApp {
     updateMetrics() {
         this.metrics.uptime = Date.now() - this.startTime;
         
-        // Clean up token monitor cache periodically
-        if (this.tokenMonitor) {
-            this.tokenMonitor.clearProcessedTokens();
+        // Clean up monitor caches periodically
+        if (this.creationMonitor) {
+            this.creationMonitor.clearProcessedTokens();
+        }
+        if (this.migrationMonitor) {
+            this.migrationMonitor.clearProcessedTokens();
         }
     }
 
@@ -324,11 +434,19 @@ class PumpFunMonitoringApp {
 
     logConfiguration() {
         logger.info('📋 Current Configuration:');
-        logger.info(`   • Min Twitter Views: ${this.config.monitoring.minTwitterViews.toLocaleString()}`);
-        logger.info(`   • Analysis Timeout: ${this.config.monitoring.analysisTimeout / 1000}s`);
-        logger.info(`   • Max Concurrent: ${this.config.monitoring.maxConcurrentAnalyses}`);
-        logger.info(`   • Enabled Analyses: ${this.config.monitoring.enabledAnalyses.join(', ')}`);
-        logger.info(`   • Telegram Channels: ${this.config.telegram.channels.length}`);
+        logger.info(`   • Bot Mode: ${this.botMode.toUpperCase()}`);
+        
+        if (this.shouldRunCreation()) {
+            logger.info(`   • Creation Min Twitter Views: ${this.config.creation.minTwitterViews.toLocaleString()}`);
+            logger.info(`   • Creation Telegram Channels: ${this.config.creation.telegram.channels.length}`);
+        }
+        
+        if (this.shouldRunMigration()) {
+            logger.info(`   • Migration Min Twitter Views: ${this.config.migration.minTwitterViews.toLocaleString()}`);
+            logger.info(`   • Migration Telegram Channels: ${this.config.migration.telegram.channels.length}`);
+        }
+        
+        logger.info(`   • Max Concurrent Analyses: ${this.config.creation.maxConcurrentAnalyses}`);
         logger.info(`   • WebSocket Reconnects: ${this.config.websocket.maxReconnectAttempts}`);
     }
 
@@ -394,12 +512,17 @@ class PumpFunMonitoringApp {
                 this.wsManager = null;
             }
 
-            // Stop token monitor
-            if (this.tokenMonitor) {
-                // Cancel any active analyses
-                const status = this.tokenMonitor.getStatus();
-                logger.info(`Stopping with ${status.currentlyAnalyzing} active analyses`);
-                this.tokenMonitor = null;
+            // Stop monitors
+            if (this.creationMonitor) {
+                const status = this.creationMonitor.getStatus();
+                logger.info(`Stopping creation monitor with ${status.currentlyAnalyzing} active analyses`);
+                this.creationMonitor = null;
+            }
+            
+            if (this.migrationMonitor) {
+                const status = this.migrationMonitor.getStatus();
+                logger.info(`Stopping migration monitor with ${status.currentlyAnalyzing} active analyses`);
+                this.migrationMonitor = null;
             }
 
             logger.info('🛑 Application stopped');
@@ -414,39 +537,33 @@ class PumpFunMonitoringApp {
     getStatus() {
         return {
             isRunning: this.isRunning,
+            mode: this.botMode,
             startTime: this.startTime,
             websocket: this.wsManager?.getConnectionInfo() || null,
-            monitor: this.tokenMonitor?.getStatus() || null,
+            creationMonitor: this.creationMonitor?.getStatus() || null,
+            migrationMonitor: this.migrationMonitor?.getStatus() || null,
             metrics: this.getMetrics(),
             config: {
-                minTwitterViews: this.config.monitoring.minTwitterViews,
-                enabledAnalyses: this.config.monitoring.enabledAnalyses,
-                telegramChannels: this.config.telegram.channels.length
+                mode: this.botMode,
+                creation: this.shouldRunCreation() ? {
+                    minTwitterViews: this.config.creation.minTwitterViews,
+                    telegramChannels: this.config.creation.telegram.channels.length
+                } : null,
+                migration: this.shouldRunMigration() ? {
+                    minTwitterViews: this.config.migration.minTwitterViews,
+                    telegramChannels: this.config.migration.telegram.channels.length
+                } : null
             }
         };
-    }
-
-    // Development/testing methods
-    async testConfiguration() {
-        const results = {
-            websocket: { configured: !!this.wsManager },
-            telegram: null
-        };
-
-        if (this.tokenMonitor?.telegramPublisher) {
-            results.telegram = await this.tokenMonitor.telegramPublisher.testConfiguration();
-        }
-
-        return results;
     }
 }
 
 // Export for use as module
-module.exports = PumpFunMonitoringApp;
+module.exports = PumpFunUnifiedApp;
 
 // Run as standalone application if called directly
 if (require.main === module) {
-    const app = new PumpFunMonitoringApp();
+    const app = new PumpFunUnifiedApp();
     
     app.start().catch(error => {
         logger.error('Failed to start application:', error);

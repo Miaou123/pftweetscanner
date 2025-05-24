@@ -1,4 +1,4 @@
-// src/validators/twitterValidator.js - Clean version
+// src/validators/twitterValidator.js - Updated with publishing date
 const axios = require('axios');
 const logger = require('../utils/logger');
 const { retryWithBackoff } = require('../utils/retryUtils');
@@ -70,7 +70,8 @@ class TwitterValidator {
                 views: 0,
                 likes: 0,
                 retweets: 0,
-                replies: 0
+                replies: 0,
+                publishedAt: null
             };
 
         } catch (error) {
@@ -118,7 +119,8 @@ class TwitterValidator {
                     views: parseInt(data.view_count) || parseInt(data.viewCount) || 0,
                     likes: parseInt(data.favorite_count) || parseInt(data.favoriteCount) || parseInt(data.like_count) || 0,
                     retweets: parseInt(data.retweet_count) || parseInt(data.retweetCount) || parseInt(data.quote_count) || 0,
-                    replies: parseInt(data.reply_count) || parseInt(data.replyCount) || parseInt(data.conversation_count) || 0
+                    replies: parseInt(data.reply_count) || parseInt(data.replyCount) || parseInt(data.conversation_count) || 0,
+                    publishedAt: this.parseTwitterDate(data.created_at || data.created_time || data.time)
                 };
                 
                 logger.debug(`Parsed metrics for ${tweetId}:`, metrics);
@@ -127,6 +129,33 @@ class TwitterValidator {
             return null;
         } catch (error) {
             logger.debug(`Syndication API failed for tweet ${tweetId}:`, error.message);
+            return null;
+        }
+    }
+
+    parseTwitterDate(dateString) {
+        if (!dateString) return null;
+        
+        try {
+            // Handle different date formats from Twitter API
+            let date;
+            if (typeof dateString === 'number') {
+                // Unix timestamp
+                date = new Date(dateString * 1000);
+            } else {
+                // ISO string or other format
+                date = new Date(dateString);
+            }
+            
+            // Validate the date
+            if (isNaN(date.getTime())) {
+                logger.debug('Invalid date parsed:', dateString);
+                return null;
+            }
+            
+            return date.toISOString();
+        } catch (error) {
+            logger.debug('Error parsing Twitter date:', error);
             return null;
         }
     }
@@ -147,7 +176,7 @@ class TwitterValidator {
             rateLimitedUntil: this.rateLimitedUntil,
             isRateLimited: this.isRateLimited(),
             requestCount: this.requestCount,
-            method: 'clean-validation'
+            method: 'clean-validation-with-date'
         };
     }
 }

@@ -1,4 +1,4 @@
-// src/monitors/tokenDeploymentMonitor.js - Updated with bot type configuration
+// src/monitors/tokenDeploymentMonitor.js - Updated with Simple Timing
 const EventEmitter = require('events');
 const axios = require('axios');
 const logger = require('../utils/logger');
@@ -13,6 +13,8 @@ class TokenDeploymentMonitor extends EventEmitter {
         this.config = {
             minTwitterViews: parseInt(process.env.MIN_TWITTER_VIEWS) || config.minTwitterViews || 100000,
             minTwitterLikes: parseInt(process.env.MIN_TWITTER_LIKES) || config.minTwitterLikes || 1,
+            minMigrationTwitterViews: parseInt(process.env.MIN_MIGRATION_TWITTER_VIEWS) || config.minMigrationTwitterViews || 50000,
+            minMigrationTwitterLikes: parseInt(process.env.MIN_MIGRATION_TWITTER_LIKES) || config.minMigrationTwitterLikes || 1,
             analysisTimeout: parseInt(process.env.ANALYSIS_TIMEOUT) || config.analysisTimeout || 5 * 60 * 1000,
             maxConcurrentAnalyses: parseInt(process.env.MAX_CONCURRENT_ANALYSES) || config.maxConcurrentAnalyses || 3,
             processingDelay: parseInt(process.env.PROCESSING_DELAY) || config.processingDelay || 2000,
@@ -21,18 +23,11 @@ class TokenDeploymentMonitor extends EventEmitter {
         };
 
         logger.info(`📋 TokenDeploymentMonitor Config:`);
-        logger.info(`   • Min Twitter Views: ${this.config.minTwitterViews.toLocaleString()}`);
-        logger.info(`   • Min Twitter Likes: ${this.config.minTwitterLikes.toLocaleString()}`);
+        logger.info(`   • Min Twitter Views (Creation): ${this.config.minTwitterViews.toLocaleString()}`);
+        logger.info(`   • Min Twitter Likes (Creation): ${this.config.minTwitterLikes.toLocaleString()}`);
 
         this.twitterValidator = new TwitterValidator();
-        
-        // Pass bot type to analysis orchestrator
-        // Pass bot type to analysis orchestrator
-        this.analysisOrchestrator = new AnalysisOrchestrator({
-            ...this.config,
-            botType: 'creation' // This monitor handles creation events
-        });
-        
+        this.analysisOrchestrator = new AnalysisOrchestrator(this.config);
         this.solanaApi = getSolanaApi();
         
         this.processedTokens = new Set();
@@ -41,12 +36,14 @@ class TokenDeploymentMonitor extends EventEmitter {
         this.isProcessing = false;
         this.stats = {
             tokensProcessed: 0,
+            migrationsProcessed: 0,
             tokensAnalyzed: 0,
             tokensSkipped: 0,
             errors: 0
         };
 
         this.processNewToken = this.processNewToken.bind(this);
+        this.processTokenMigration = this.processTokenMigration.bind(this);
         this.processQueue = this.processQueue.bind(this);
         
         this.startQueueProcessor();
@@ -54,6 +51,8 @@ class TokenDeploymentMonitor extends EventEmitter {
     }
 
     async processNewToken(tokenEvent) {
+        const timer = tokenEvent.timer; // Get simple timer from WebSocket
+        
         try {
             logger.info(`🔍 Processing new token: ${tokenEvent.name} (${tokenEvent.symbol}) - ${tokenEvent.mint}`);
             this.stats.tokensProcessed++;
@@ -73,6 +72,7 @@ class TokenDeploymentMonitor extends EventEmitter {
             this.processedTokens.add(tokenEvent.mint);
 
             const twitterLink = await this.extractTwitterLink(tokenEvent);
+
             if (!twitterLink) {
                 logger.debug(`No Twitter link found for ${tokenEvent.symbol} (${tokenEvent.mint})`);
                 this.stats.tokensSkipped++;
@@ -85,13 +85,94 @@ class TokenDeploymentMonitor extends EventEmitter {
                 tokenEvent,
                 twitterLink,
                 timestamp: Date.now(),
-                eventType: 'creation'
+                eventType: 'creation',
+                timer // Pass simple timer along
             });
 
             logger.debug(`Added ${tokenEvent.symbol} to processing queue. Queue size: ${this.processingQueue.length}`);
 
         } catch (error) {
             logger.error(`Error processing new token ${tokenEvent.mint}:`, error);
+            this.stats.errors++;
+        }
+    }
+
+    async processTokenMigration(migrationEvent) {
+        const timer = migrationEvent.timer; // Get simple timer from WebSocket
+        
+        try {
+            logger.info(`🔄 Processing token migration: ${migrationEvent.mint}`);
+            this.stats.migrationsProcessed++;
+            
+            // For migrations, we might not have token metadata immediately
+            let tokenInfo = {
+                mint: migrationEvent.mint,
+                name: migrationEvent.name,
+                symbol: migrationEvent.symbol,
+                uri: migrationEvent.uri
+            };
+
+            // If we don't have name/symbol, try to fetch from Solana
+            if (!tokenInfo.name || !tokenInfo.symbol) {
+                logger.info(`Fetching token metadata for migration: ${migrationEvent.mint}`);
+                try {
+                    const solanaTokenData = await this.solanaApi.getAsset(migrationEvent.mint);
+                    if (solanaTokenData) {
+                        tokenInfo.name = solanaTokenData.name;
+                        tokenInfo.symbol = solanaTokenData.symbol;
+                        logger.info(`Retrieved token info: ${tokenInfo.name} (${tokenInfo.symbol})`);
+                    }
+                } catch (error) {
+                    logger.warn(`Failed to fetch Solana metadata for ${migrationEvent.mint}:`, error.message);
+                }
+            }
+
+            if (!tokenInfo.name || !tokenInfo.symbol) {
+                logger.warn(`Could not retrieve token metadata for migration ${migrationEvent.mint}, skipping`);
+                this.stats.tokensSkipped++;
+                return;
+            }
+
+            // Create a token event structure
+            const tokenEvent = {
+                ...migrationEvent,
+                eventType: 'migration',
+                name: tokenInfo.name,
+                symbol: tokenInfo.symbol,
+                uri: tokenInfo.uri,
+                timer: timer // Keep timer reference
+            };
+
+            if (this.processedTokens.has(tokenEvent.mint)) {
+                logger.debug(`Migration token ${tokenEvent.mint} already processed, skipping`);
+                this.stats.tokensSkipped++;
+                return;
+            }
+
+            this.processedTokens.add(tokenEvent.mint);
+
+            const twitterLink = await this.extractTwitterLink(tokenEvent);
+
+            if (!twitterLink) {
+                logger.debug(`No Twitter link found for migration ${tokenEvent.symbol} (${tokenEvent.mint})`);
+                this.stats.tokensSkipped++;
+                return;
+            }
+
+            logger.info(`📱 Twitter link found for migration ${tokenEvent.symbol}: ${twitterLink}`);
+
+            this.processingQueue.push({
+                tokenEvent,
+                twitterLink,
+                timestamp: Date.now(),
+                eventType: 'migration',
+                timer // Pass simple timer along
+            });
+
+            logger.debug(`Added migration ${tokenEvent.symbol} to processing queue. Queue size: ${this.processingQueue.length}`);
+
+        } catch (error) {
+            logger.error(`Error processing token migration ${migrationEvent.mint}:`, error);
             this.stats.errors++;
         }
     }
@@ -249,8 +330,8 @@ class TokenDeploymentMonitor extends EventEmitter {
     }
 
     async processQueueItem(item) {
-        const { tokenEvent, twitterLink, timestamp, eventType } = item;
-        const operationId = `${tokenEvent.symbol}_${eventType}_${Date.now()}`;
+        const { tokenEvent, twitterLink, timestamp, eventType, timer } = item;
+        const operationId = timer.operationId;
 
         try {
             logger.info(`🔄 [${operationId}] Processing queued ${eventType}: ${tokenEvent.symbol}`);
@@ -262,7 +343,7 @@ class TokenDeploymentMonitor extends EventEmitter {
             }
 
             const twitterMetrics = await this.twitterValidator.validateEngagement(twitterLink);
-            
+
             if (!twitterMetrics) {
                 logger.info(`[${operationId}] Failed to get Twitter metrics for ${tokenEvent.symbol}`);
                 this.stats.tokensSkipped++;
@@ -271,19 +352,23 @@ class TokenDeploymentMonitor extends EventEmitter {
 
             logger.info(`[${operationId}] Twitter metrics for ${tokenEvent.symbol}: ${twitterMetrics.likes} likes, ${twitterMetrics.retweets} retweets, ${twitterMetrics.replies} replies, ${twitterMetrics.views} views`);
 
-            if (twitterMetrics.likes < this.config.minTwitterLikes && twitterMetrics.views < this.config.minTwitterViews) {
-                logger.info(`[${operationId}] ${tokenEvent.symbol} has ${twitterMetrics.likes} likes and ${twitterMetrics.views} views (< ${this.config.minTwitterLikes} likes or ${this.config.minTwitterViews} views), skipping analysis`);
+            // Use different thresholds for creations vs migrations
+            const minViews = eventType === 'migration' ? this.config.minMigrationTwitterViews : this.config.minTwitterViews;
+            const minLikes = eventType === 'migration' ? this.config.minMigrationTwitterLikes : this.config.minTwitterLikes;
+
+            if (twitterMetrics.likes < minLikes && twitterMetrics.views < minViews) {
+                logger.info(`[${operationId}] ${tokenEvent.symbol} (${eventType}) has ${twitterMetrics.likes} likes and ${twitterMetrics.views} views (< ${minLikes} likes or ${minViews} views), skipping analysis`);
                 this.stats.tokensSkipped++;
                 return;
             }
 
-            if (twitterMetrics.likes >= this.config.minTwitterLikes) {
-                logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} meets criteria (${twitterMetrics.likes} likes >= ${this.config.minTwitterLikes})! Starting analysis...`);
+            if (twitterMetrics.likes >= minLikes) {
+                logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} (${eventType}) meets criteria (${twitterMetrics.likes} likes >= ${minLikes})! Starting analysis...`);
             } else {
-                logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} meets criteria (${twitterMetrics.views} views >= ${this.config.minTwitterViews})! Starting analysis...`);
+                logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} (${eventType}) meets criteria (${twitterMetrics.views} views >= ${minViews})! Starting analysis...`);
             }
             
-            await this.triggerAnalysis(tokenEvent, twitterMetrics, operationId);
+            await this.triggerAnalysis(tokenEvent, twitterMetrics, operationId, timer);
 
         } catch (error) {
             logger.error(`[${operationId}] Error processing queue item:`, error);
@@ -291,7 +376,7 @@ class TokenDeploymentMonitor extends EventEmitter {
         }
     }
 
-    async triggerAnalysis(tokenEvent, twitterMetrics, operationId) {
+    async triggerAnalysis(tokenEvent, twitterMetrics, operationId, timer) {
         if (this.currentlyAnalyzing.size >= this.config.maxConcurrentAnalyses) {
             logger.warn(`[${operationId}] Maximum concurrent analyses reached, queuing for later`);
             setTimeout(() => {
@@ -299,7 +384,8 @@ class TokenDeploymentMonitor extends EventEmitter {
                     tokenEvent, 
                     twitterLink: twitterMetrics.link, 
                     timestamp: Date.now(),
-                    eventType: 'creation'
+                    eventType: tokenEvent.eventType || 'creation',
+                    timer: timer
                 });
             }, 30000);
             return;
@@ -315,14 +401,16 @@ class TokenDeploymentMonitor extends EventEmitter {
                     symbol: tokenEvent.symbol,
                     creator: tokenEvent.traderPublicKey || tokenEvent.creator,
                     address: tokenEvent.mint,
-                    eventType: 'creation'
+                    eventType: tokenEvent.eventType || 'creation'
                 },
                 twitterMetrics,
-                operationId
+                operationId,
+                timer: timer // Pass simple timer to orchestrator
             });
 
             if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Creation analysis completed successfully for ${tokenEvent.symbol}`);
+                const eventType = tokenEvent.eventType === 'migration' ? 'migration' : 'creation';
+                logger.info(`✅ [${operationId}] Analysis completed successfully for ${tokenEvent.symbol} (${eventType})`);
                 this.stats.tokensAnalyzed++;
                 
                 this.emit('analysisCompleted', {
@@ -332,7 +420,7 @@ class TokenDeploymentMonitor extends EventEmitter {
                     operationId
                 });
             } else {
-                logger.error(`❌ [${operationId}] Creation analysis failed for ${tokenEvent.symbol}:`, analysisResult.error);
+                logger.error(`❌ [${operationId}] Analysis failed for ${tokenEvent.symbol}:`, analysisResult.error);
                 this.stats.errors++;
             }
 
@@ -346,15 +434,13 @@ class TokenDeploymentMonitor extends EventEmitter {
 
     getStatus() {
         return {
-            botType: 'creation',
             processedTokensCount: this.processedTokens.size,
             queueLength: this.processingQueue.length,
             currentlyAnalyzing: this.currentlyAnalyzing.size,
             maxConcurrentAnalyses: this.config.maxConcurrentAnalyses,
             isProcessing: this.isProcessing,
             stats: this.stats,
-            config: this.config,
-            enabledAnalyses: this.analysisOrchestrator.getEnabledAnalyses()
+            config: this.config
         };
     }
 
@@ -366,20 +452,22 @@ class TokenDeploymentMonitor extends EventEmitter {
     }
 
     getStatsString() {
-        const { tokensProcessed, tokensAnalyzed, tokensSkipped, errors } = this.stats;
-        const successRate = tokensProcessed > 0 ? ((tokensAnalyzed / tokensProcessed) * 100).toFixed(1) : 0;
+        const { tokensProcessed, migrationsProcessed, tokensAnalyzed, tokensSkipped, errors } = this.stats;
+        const totalProcessed = tokensProcessed + migrationsProcessed;
+        const successRate = totalProcessed > 0 ? ((tokensAnalyzed / totalProcessed) * 100).toFixed(1) : 0;
         
-        return `📊 Creation Stats: ${tokensProcessed} processed | ${tokensAnalyzed} analyzed | ${tokensSkipped} skipped | ${errors} errors | ${successRate}% success rate`;
+        return `📊 Stats: ${tokensProcessed} tokens | ${migrationsProcessed} migrations | ${tokensAnalyzed} analyzed | ${tokensSkipped} skipped | ${errors} errors | ${successRate}% success rate`;
     }
 
     resetStats() {
         this.stats = {
             tokensProcessed: 0,
+            migrationsProcessed: 0,
             tokensAnalyzed: 0,
             tokensSkipped: 0,
             errors: 0
         };
-        logger.info('Creation statistics reset');
+        logger.info('Statistics reset');
     }
 }
 

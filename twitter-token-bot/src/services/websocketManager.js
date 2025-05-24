@@ -1,7 +1,8 @@
-// src/services/websocketManager.js - Unified WebSocket Manager (Both Creation & Migration)
+// src/services/websocketManager.js - Updated with Timing Tracking
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
+const { createTimer } = require('../utils/simpleTimer');
 
 class WebSocketManager extends EventEmitter {
     constructor(config = {}) {
@@ -16,6 +17,13 @@ class WebSocketManager extends EventEmitter {
         this.subscriptions = new Set();
         this.pingTimer = null;
         this.connectionId = Math.random().toString(36).substring(7);
+        
+        // Timing statistics
+        this.messageStats = {
+            received: 0,
+            processed: 0,
+            errors: 0
+        };
         
         // Bind methods to preserve context
         this.connect = this.connect.bind(this);
@@ -56,7 +64,9 @@ class WebSocketManager extends EventEmitter {
     }
 
     handleMessage(data) {
-        console.log('🔍 RAW WEBSOCKET MESSAGE:', data.toString().substring(0, 200) + '...'); // Debug line
+        const messageReceivedTime = Date.now();
+        this.messageStats.received++;
+        
         try {
             const message = JSON.parse(data.toString());
             
@@ -68,16 +78,12 @@ class WebSocketManager extends EventEmitter {
             
             // Check if this is a token creation event
             if (message.txType === 'create' && message.mint && message.name && message.symbol) {
+                const operationId = `${message.symbol}_creation_${Date.now()}`;
+                
+                // Start simple timer
+                const timer = createTimer(operationId);
+                
                 logger.info(`[${this.connectionId}] 🪙 NEW TOKEN: ${message.name} (${message.symbol}) - ${message.mint}`);
-                logger.debug(`[${this.connectionId}] Token details:`, {
-                    mint: message.mint,
-                    name: message.name,
-                    symbol: message.symbol,
-                    uri: message.uri,
-                    creator: message.traderPublicKey,
-                    marketCapSol: message.marketCapSol,
-                    initialBuy: message.initialBuy
-                });
                 
                 // Transform the message to match expected format
                 const tokenEvent = {
@@ -92,7 +98,9 @@ class WebSocketManager extends EventEmitter {
                     marketCapSol: message.marketCapSol,
                     initialBuy: message.initialBuy,
                     solAmount: message.solAmount,
-                    timestamp: Date.now(),
+                    timestamp: messageReceivedTime,
+                    operationId: operationId,
+                    timer: timer, // Pass simple timer
                     // Additional metadata
                     bondingCurveKey: message.bondingCurveKey,
                     vTokensInBondingCurve: message.vTokensInBondingCurve,
@@ -100,6 +108,7 @@ class WebSocketManager extends EventEmitter {
                     pool: message.pool
                 };
                 
+                this.messageStats.processed++;
                 this.emit('newToken', tokenEvent);
             }
             // Check if this is a migration event
@@ -107,14 +116,12 @@ class WebSocketManager extends EventEmitter {
                 message.type === 'migration' || 
                 (message.signature && message.mint && this.isMigrationEvent(message))) {
                 
+                const operationId = `${message.mint.substring(0, 8)}_migration_${Date.now()}`;
+                
+                // Start simple timer for migration
+                const timer = createTimer(operationId);
+                
                 logger.info(`[${this.connectionId}] 🔄 MIGRATION: Token ${message.mint} - Signature: ${message.signature}`);
-                logger.debug(`[${this.connectionId}] Migration details:`, {
-                    mint: message.mint,
-                    signature: message.signature,
-                    pool: message.pool,
-                    timestamp: message.timestamp,
-                    allFields: Object.keys(message)
-                });
                 
                 // Transform migration event
                 const migrationEvent = {
@@ -122,9 +129,10 @@ class WebSocketManager extends EventEmitter {
                     mint: message.mint,
                     signature: message.signature,
                     pool: message.pool,
-                    timestamp: Date.now(),
+                    timestamp: messageReceivedTime,
+                    operationId: operationId,
+                    timer: timer, // Pass simple timer
                     // Migration events may not have name/symbol immediately
-                    // We'll need to fetch this data separately
                     name: message.name || null,
                     symbol: message.symbol || null,
                     uri: message.uri || null,
@@ -139,6 +147,7 @@ class WebSocketManager extends EventEmitter {
                     rawData: message
                 };
                 
+                this.messageStats.processed++;
                 this.emit('tokenMigration', migrationEvent);
             }
             // Log other message types for debugging
@@ -155,6 +164,7 @@ class WebSocketManager extends EventEmitter {
                 logger.debug(`[${this.connectionId}] ❓ Unknown message type: ${Object.keys(message).join(', ')}`);
             }
         } catch (error) {
+            this.messageStats.errors++;
             logger.error(`[${this.connectionId}] Error parsing WebSocket message:`, error);
             logger.debug('Raw message data:', data.toString().substring(0, 500) + '...');
         }
@@ -307,8 +317,17 @@ class WebSocketManager extends EventEmitter {
             isConnected: this.isConnected,
             reconnectAttempts: this.reconnectAttempts,
             subscriptionsCount: this.subscriptions.size,
-            subscriptionType: 'migration-only',
-            readyState: this.ws ? this.ws.readyState : 'Not initialized'
+            readyState: this.ws ? this.ws.readyState : 'Not initialized',
+            messageStats: this.messageStats
+        };
+    }
+
+    getMessageStats() {
+        return {
+            ...this.messageStats,
+            uptime: this.isConnected ? Date.now() - (this.connectTime || Date.now()) : 0,
+            averageProcessingTime: this.messageStats.processed > 0 ? 
+                (this.messageStats.totalProcessingTime || 0) / this.messageStats.processed : 0
         };
     }
 

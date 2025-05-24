@@ -1,4 +1,4 @@
-// src/publishers/telegramPublisher.js
+// src/publishers/telegramPublisher.js - Updated with Top Holders Analysis
 const logger = require('../utils/logger');
 const { formatNumber } = require('../utils/formatters');
 
@@ -42,6 +42,11 @@ class TelegramPublisher {
             const results = await Promise.allSettled(promises);
             const successful = results.filter(r => r.status === 'fulfilled').length;
             
+            // Log final timing
+            if (analysisResult.timer) {
+                logger.info(`⏱️ [${analysisResult.operationId}] Total pipeline time: ${analysisResult.timer.getElapsedSeconds()}s`);
+            }
+            
             logger.info(`📤 Published analysis to ${successful}/${this.config.channels.length} channels`);
 
         } catch (error) {
@@ -50,18 +55,28 @@ class TelegramPublisher {
     }
 
     formatAnalysisMessage(analysisResult) {
-        const { tokenInfo, twitterMetrics, analyses, operationId } = analysisResult;
+        const { tokenInfo, twitterMetrics, analyses, operationId, summary } = analysisResult;
         
-        // Header with token info
-        let message = this.formatHeader(tokenInfo, twitterMetrics);
+        // Header with token info and overall risk
+        let message = this.formatHeader(tokenInfo, twitterMetrics, summary);
         
         // Bundle analysis results
         if (analyses.bundle && analyses.bundle.success) {
             message += this.formatBundleAnalysis(analyses.bundle.result);
         }
         
+        // Top Holders analysis results
+        if (analyses.topHolders && analyses.topHolders.success) {
+            message += this.formatTopHoldersAnalysis(analyses.topHolders.result);
+        }
+
+        // Overall summary flags
+        if (summary && summary.flags && summary.flags.length > 0) {
+            message += this.formatSummaryFlags(summary.flags);
+        }
+        
         // Links and footer
-        message += this.formatFooter(tokenInfo.address || tokenInfo.mint, operationId, twitterMetrics.link);
+        message += this.formatFooter(tokenInfo.address || tokenInfo.mint, operationId, twitterMetrics.link, analysisResult.timer);
         
         // Truncate if too long
         if (message.length > this.config.maxMessageLength) {
@@ -71,12 +86,17 @@ class TelegramPublisher {
         return message;
     }
 
-    formatHeader(tokenInfo, twitterMetrics) {
+    formatHeader(tokenInfo, twitterMetrics, summary) {
         const symbol = tokenInfo.symbol || 'Unknown';
         const name = tokenInfo.name || 'Unknown Token';
         const eventType = tokenInfo.eventType === 'migration' ? '🔄 MIGRATION' : '🆕 NEW TOKEN';
         
-        let header = `${eventType} | <b>${symbol}</b> | ${name}\n`;
+        // Add risk level indicator
+        const riskEmoji = this.getRiskEmoji(summary?.riskLevel || 'UNKNOWN');
+        const riskLevel = summary?.riskLevel || 'UNKNOWN';
+        
+        let header = `${eventType} | ${riskEmoji} ${riskLevel} | <b>${symbol}</b>\n`;
+        header += `${name}\n`;
         
         if (twitterMetrics) {
             const likesText = twitterMetrics.likes > 0 ? `${formatNumber(twitterMetrics.likes)} likes` : '';
@@ -95,44 +115,83 @@ class TelegramPublisher {
             }
         }
         
-        return header;
+        return header + '\n';
     }
 
     formatBundleAnalysis(result) {
         if (!result) return '';
         
-        let section = '\n<b>Bundle Analysis:</b>\n';
+        let section = '<b>📦 Bundle Analysis:</b>\n';
         
         if (result.bundleDetected) {
-            // Count total transactions across all bundles
-            const totalTransactions = result.bundles.reduce((sum, bundle) => sum + bundle.transactions.length, 0);
             const totalBoughtPercentage = result.percentageBundled || 0;
-            
-            // Use the ACTUAL calculated holding percentage
             const currentlyHeldPercentage = result.totalHoldingAmountPercentage || 0;
             
-            section += `📦 Total Bundles: ${result.bundles.length}\n`;
-            section += `🪙 Total Tokens Bundled: ${this.formatLargeNumber(result.totalTokensBundled)} ${result.tokenInfo?.symbol || 'tokens'} (${totalBoughtPercentage.toFixed(2)}%)\n`;
-            section += `🔒 Total Holding Amount: ${this.formatLargeNumber(result.totalHoldingAmount)} ${result.tokenInfo?.symbol || 'tokens'} (${currentlyHeldPercentage.toFixed(2)}%)\n`;
+            section += `• Bundles Found: ${result.bundles.length}\n`;
+            section += `• Tokens Bundled: ${this.formatLargeNumber(result.totalTokensBundled)} (${totalBoughtPercentage.toFixed(2)}%)\n`;
+            section += `• Currently Held: ${this.formatLargeNumber(result.totalHoldingAmount)} (${currentlyHeldPercentage.toFixed(2)}%)\n`;
             
-            // Get top 5 wallets by holding amount
-            const topWallets = this.getTopWalletsByHolding(result.bundles);
-            
-            if (topWallets.length > 0) {
-                section += `Top ${Math.min(5, topWallets.length)} wallets: `;
-                const walletLinks = topWallets.slice(0, 5).map(([wallet, holdingAmount]) => {
-                    const shortWallet = `${wallet.substring(0, 5)}...${wallet.substring(wallet.length - 4)}`;
-                    return `<a href="https://solscan.io/account/${wallet}">${shortWallet}</a>`;
-                });
-                section += walletLinks.join(', ');
-            }
-            
-            section += '\n\n';
         } else {
-            section += '✅ No significant bundling detected\n\n';
+            section += '✅ No significant bundling detected\n';
         }
         
-        return section;
+        return section + '\n';
+    }
+
+    formatTopHoldersAnalysis(result) {
+        if (!result || !result.summary) return '';
+        
+        const summary = result.summary;
+        let section = '<b>👥 Top 20 Holders Analysis:</b>\n';
+        
+        // Wallet type breakdown (only whales, fresh, and regular)
+        section += `• 🐋 Whales: ${summary.whaleCount}/20 (${summary.whalePercentage}%)\n`;
+        section += `• 🆕 Fresh Wallets: ${summary.freshWalletCount}/20 (${summary.freshWalletPercentage}%)\n`;
+        section += `• 👤 Regular: ${summary.regularWalletCount}/20\n`;
+        
+        // Concentration metrics
+        section += `• Top 5 Holdings: ${summary.concentration.top5Percentage}%\n`;
+        section += `• Top 10 Holdings: ${summary.concentration.top10Percentage}%\n`;
+        
+        // Risk assessment
+        const riskEmoji = this.getRiskEmoji(summary.riskLevel);
+        section += `• Risk Level: ${riskEmoji} ${summary.riskLevel} (Score: ${summary.riskScore}/100)\n`;
+        
+        return section + '\n';
+    }
+
+    formatSummaryFlags(flags) {
+        if (!flags || flags.length === 0) return '';
+        
+        let section = '<b>🚩 Analysis Summary:</b>\n';
+        
+        // Group flags by type for better organization
+        const criticalFlags = flags.filter(flag => flag.includes('🔴'));
+        const warningFlags = flags.filter(flag => flag.includes('🟡'));
+        const successFlags = flags.filter(flag => flag.includes('✅'));
+        
+        // Show critical flags first
+        if (criticalFlags.length > 0) {
+            criticalFlags.forEach(flag => {
+                section += `${flag}\n`;
+            });
+        }
+        
+        // Then warning flags
+        if (warningFlags.length > 0) {
+            warningFlags.forEach(flag => {
+                section += `${flag}\n`;
+            });
+        }
+        
+        // Finally success flags
+        if (successFlags.length > 0 && criticalFlags.length === 0 && warningFlags.length === 0) {
+            successFlags.forEach(flag => {
+                section += `${flag}\n`;
+            });
+        }
+        
+        return section + '\n';
     }
 
     formatLargeNumber(num) {
@@ -151,46 +210,19 @@ class TelegramPublisher {
         return Math.round(num).toString();
     }
 
-    getTopWalletsByHolding(bundles) {
-        // Create a map of all wallets and their total holdings across all bundles
-        const walletHoldings = new Map();
-        
-        bundles.forEach(bundle => {
-            bundle.uniqueWallets.forEach(wallet => {
-                // For each wallet, we need to get their total holding amount
-                // Since bundles might share wallets, we need to avoid double counting
-                if (!walletHoldings.has(wallet)) {
-                    // Find the wallet's total holding from bundle data
-                    let walletTotalHolding = 0;
-                    bundles.forEach(b => {
-                        if (b.uniqueWallets.includes(wallet)) {
-                            // Calculate wallet's proportion of this bundle's holding
-                            const walletProportion = 1 / b.uniqueWalletsCount; // Simple equal split assumption
-                            walletTotalHolding += (b.holdingAmount || 0) * walletProportion;
-                        }
-                    });
-                    walletHoldings.set(wallet, walletTotalHolding);
-                }
-            });
-        });
-        
-        // Sort by holding amount and return as array of [wallet, amount] pairs
-        return Array.from(walletHoldings.entries())
-            .sort((a, b) => b[1] - a[1]);
-    }
-
-    getTopBundleHolders(bundles) {
-        // This method is now replaced by getTopWalletsByHolding but kept for compatibility
-        return this.getTopWalletsByHolding(bundles);
-    }
-
-    formatFooter(tokenAddress, operationId, twitterLink) {
+    formatFooter(tokenAddress, operationId, twitterLink, timer = null) {
         let footer = '<b>🔗 Links:</b>\n';
         footer += `🐦 <a href="${twitterLink}">Tweet</a> | `;
         footer += `📈 <a href="https://dexscreener.com/solana/${tokenAddress}">DexScreener</a> | `;
         footer += `🔥 <a href="https://pump.fun/${tokenAddress}">Pump.fun</a> | `;
         footer += `📊 <a href="https://solscan.io/token/${tokenAddress}">Solscan</a>\n\n`;
-        footer += `<i>Analysis ID: ${operationId}</i>`;
+        
+        // Add analysis time if timer is available
+        if (timer) {
+            footer += `<i>Analysis time: ${timer.getElapsedSeconds()}s | ID: ${operationId}</i>`;
+        } else {
+            footer += `<i>Analysis ID: ${operationId}</i>`;
+        }
         
         return footer;
     }
@@ -224,14 +256,14 @@ class TelegramPublisher {
     }
 
     getRiskEmoji(riskLevel) {
-        // Method kept for compatibility but not used in clean format
-        switch (riskLevel) {
-            case 'LOW': return '🟢';
-            case 'MEDIUM': return '🟡';
-            case 'HIGH': return '🟠';
-            case 'VERY_HIGH': return '🔴';
-            default: return '⚪';
-        }
+        const riskEmojis = {
+            'LOW': '🟢',
+            'MEDIUM': '🟡',
+            'HIGH': '🟠',
+            'VERY_HIGH': '🔴',
+            'UNKNOWN': '⚪'
+        };
+        return riskEmojis[riskLevel] || riskEmojis['UNKNOWN'];
     }
 
     truncateMessage(message) {
@@ -253,7 +285,7 @@ class TelegramPublisher {
 
         const sendOptions = {
             parse_mode: 'HTML',
-            disable_web_page_preview: true, // Always disable previews to avoid embedded links
+            disable_web_page_preview: true,
             ...options
         };
 

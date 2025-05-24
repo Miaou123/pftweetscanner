@@ -1,6 +1,5 @@
-// src/analysis/bundleAnalyzer.js
+// src/analysis/bundleAnalyzer.js - No Helius version
 const pumpfunApi = require('../integrations/pumpfunApi');
-const { getSolanaApi } = require('../integrations/solanaApi');
 const logger = require('../utils/logger');
 const BigNumber = require('bignumber.js');
 
@@ -16,32 +15,22 @@ class BundleAnalyzer {
     async analyzeBundle(tokenAddress, limit = 50000) {
         try {
             logger.info(`Starting bundle analysis for token: ${tokenAddress}`);
-            
-            // Check if this is a PumpFun token
-            const isPumpfun = await this.isPumpfunToken(tokenAddress);
-            if (!isPumpfun) {
-                logger.info(`Token ${tokenAddress} is not a PumpFun token, skipping bundle analysis`);
-                return {
-                    success: false,
-                    error: 'Not a PumpFun token',
-                    bundleDetected: false
-                };
-            }
 
-            // Get token info
-            const tokenInfo = await this.getTokenInfo(tokenAddress);
-            
-            // Fetch all trades for the token
+            // Fetch all trades for the token from PumpFun
             const allTrades = await this.fetchAllTrades(tokenAddress, limit);
             
             if (!allTrades || allTrades.length === 0) {
+                logger.info(`No trades found for token ${tokenAddress}`);
                 return {
                     success: true,
                     bundleDetected: false,
                     totalTrades: 0,
-                    tokenInfo
+                    tokenInfo: this.createTokenInfoFromTrades(tokenAddress, [])
                 };
             }
+
+            // Get token info from the first trade (contains token metadata)
+            const tokenInfo = this.createTokenInfoFromTrades(tokenAddress, allTrades);
 
             // Analyze trades for bundles
             const bundleAnalysis = this.analyzeTrades(allTrades, tokenInfo);
@@ -68,48 +57,23 @@ class BundleAnalyzer {
             return {
                 success: false,
                 error: error.message,
-                bundleDetected: false
+                bundleDetected: false,
+                tokenInfo: this.createTokenInfoFromTrades(tokenAddress, [])
             };
         }
     }
 
-    async isPumpfunToken(tokenAddress) {
-        try {
-            // Try to fetch trades from PumpFun API
-            const trades = await pumpfunApi.getAllTrades(tokenAddress, 1, 0);
-            return Array.isArray(trades) && trades.length >= 0;
-        } catch (error) {
-            logger.debug(`Token ${tokenAddress} not found in PumpFun API: ${error.message}`);
-            return false;
-        }
-    }
-
-    async getTokenInfo(tokenAddress) {
-        try {
-            const solanaApi = getSolanaApi();
-            const assetInfo = await solanaApi.getAsset(tokenAddress, 'bundleAnalysis', 'getTokenInfo');
-            
-            if (!assetInfo) {
-                throw new Error('Token info not found');
-            }
-
-            return {
-                symbol: assetInfo.symbol || 'Unknown',
-                name: assetInfo.name || 'Unknown Token',
-                decimals: assetInfo.decimals || 6,
-                totalSupply: assetInfo.supply?.total || 0,
-                address: tokenAddress
-            };
-        } catch (error) {
-            logger.error(`Error fetching token info for ${tokenAddress}:`, error);
-            return {
-                symbol: 'Unknown',
-                name: 'Unknown Token',
-                decimals: 6,
-                totalSupply: 0,
-                address: tokenAddress
-            };
-        }
+    createTokenInfoFromTrades(tokenAddress, trades) {
+        // PumpFun tokens always have 1 billion supply with 6 decimals
+        const PUMPFUN_TOTAL_SUPPLY = 1000000000; // 1 billion tokens
+        
+        return {
+            symbol: 'Unknown',
+            name: 'Unknown Token',
+            decimals: this.TOKEN_DECIMALS,
+            totalSupply: PUMPFUN_TOTAL_SUPPLY,
+            address: tokenAddress
+        };
     }
 
     async fetchAllTrades(tokenAddress, limit) {
@@ -191,8 +155,12 @@ class BundleAnalyzer {
         });
 
         const bundleDetected = actualBundles.length > 0;
-        const totalSupply = parseFloat(tokenInfo.totalSupply) || 1;
-        const percentageBundled = (totalTokensBundled / totalSupply) * 100;
+        
+        // Always use 1 billion as total supply for PumpFun tokens
+        const PUMPFUN_TOTAL_SUPPLY = 1000000000;
+        const percentageBundled = (totalTokensBundled / PUMPFUN_TOTAL_SUPPLY) * 100;
+
+        logger.debug(`Bundle calculation: ${totalTokensBundled} bundled / ${PUMPFUN_TOTAL_SUPPLY} supply = ${percentageBundled.toFixed(2)}%`);
 
         return {
             bundleDetected,

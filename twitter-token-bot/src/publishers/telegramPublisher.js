@@ -60,11 +60,8 @@ class TelegramPublisher {
             message += this.formatBundleAnalysis(analyses.bundle.result);
         }
         
-        // Risk assessment
-        message += this.formatRiskAssessment(analyses.bundle);
-        
         // Links and footer
-        message += this.formatFooter(tokenInfo.address || tokenInfo.mint, operationId);
+        message += this.formatFooter(tokenInfo.address || tokenInfo.mint, operationId, twitterMetrics.link);
         
         // Truncate if too long
         if (message.length > this.config.maxMessageLength) {
@@ -83,76 +80,16 @@ class TelegramPublisher {
         header += `📊 Risk Level: <b>${summary.riskLevel}</b> (${Math.round(summary.overallScore)}/100)\n`;
         
         if (twitterMetrics) {
-            header += `🐦 Twitter: ${formatNumber(twitterMetrics.views)} views`;
-            if (twitterMetrics.likes > 0) {
-                header += ` | ${formatNumber(twitterMetrics.likes)} likes`;
+            const likesText = twitterMetrics.likes > 0 ? `${formatNumber(twitterMetrics.likes)} likes` : '';
+            const retweetsText = twitterMetrics.retweets > 0 ? `${formatNumber(twitterMetrics.retweets)} RT` : '';
+            
+            if (likesText || retweetsText) {
+                const parts = [likesText, retweetsText].filter(Boolean);
+                header += `🐦 Twitter: ${parts.join(' | ')}\n`;
             }
-            if (twitterMetrics.retweets > 0) {
-                header += ` | ${formatNumber(twitterMetrics.retweets)} RTs`;
-            }
-            header += '\n';
         }
         
-        header += '\n';
         return header;
-    }
-
-    formatRiskAssessment(summary) {
-        let assessment = '<b>📋 Analysis Summary:</b>\n';
-        assessment += `✅ Successful: ${summary.successfulAnalyses}/${summary.totalAnalyses} analyses\n`;
-        
-        if (summary.failedAnalyses > 0) {
-            assessment += `❌ Failed: ${summary.failedAnalyses} analyses\n`;
-        }
-        
-        assessment += '\n';
-        return assessment;
-    }
-
-    formatFlags(flags) {
-        let flagSection = '<b>⚠️ Key Findings:</b>\n';
-        flags.forEach(flag => {
-            flagSection += `${flag}\n`;
-        });
-        flagSection += '\n';
-        return flagSection;
-    }
-
-    formatAnalysisDetails(analyses) {
-        let details = '<b>🔍 Detailed Analysis:</b>\n';
-        
-        Object.values(analyses).forEach(analysis => {
-            if (analysis.success) {
-                details += this.formatSingleAnalysis(analysis);
-            }
-        });
-        
-        return details;
-    }
-
-    formatSingleAnalysis(analysis) {
-        const { type, result, duration } = analysis;
-        let section = '';
-        
-        switch (type) {
-            case 'bundle':
-                section += this.formatBundleAnalysis(result);
-                break;
-            case 'topHolders':
-                section += this.formatTopHoldersAnalysis(result);
-                break;
-            case 'devAnalysis':
-                section += this.formatDevAnalysis(result);
-                break;
-            case 'teamSupply':
-                section += this.formatTeamSupplyAnalysis(result);
-                break;
-            case 'freshWallets':
-                section += this.formatFreshWalletsAnalysis(result);
-                break;
-        }
-        
-        return section;
     }
 
     formatBundleAnalysis(result) {
@@ -163,113 +100,60 @@ class TelegramPublisher {
         if (result.bundleDetected) {
             section += `🔴 Bundle detected: ${result.percentageBundled?.toFixed(2)}% of supply\n`;
             section += `💰 ${formatNumber(result.totalTokensBundled)} tokens bundled\n`;
-            section += `💎 ${result.totalSolSpent?.toFixed(2)} SOL spent\n`;
+            section += `💎 ${result.totalSolSpent?.toFixed(2)} SOL spent\n\n`;
+            
+            // Add condensed bundle summary
+            section += this.formatCondensedBundleSummary(result);
         } else {
             section += '✅ No significant bundling detected\n';
         }
         
-        section += '\n';
         return section;
     }
 
-    formatTopHoldersAnalysis(result) {
-        if (!result) return '';
+    formatCondensedBundleSummary(result) {
+        const totalTransactions = result.bundles.reduce((sum, bundle) => sum + bundle.transactions.length, 0);
+        const totalBoughtPercentage = result.percentageBundled || 0;
         
-        let section = '👥 <b>Top Holders:</b>\n';
-        section += `📊 Top holders control ${result.totalSupplyControlled?.toFixed(2)}% of supply\n`;
+        // For now, assume currently held is same as bought (we'd need current balance data to be accurate)
+        const currentlyHeldPercentage = totalBoughtPercentage; // This would need actual current balance checking
         
-        if (result.filteredWallets && result.filteredWallets.length > 0) {
-            const interestingWallets = result.filteredWallets.filter(w => w.isInteresting);
-            if (interestingWallets.length > 0) {
-                section += `🎯 ${interestingWallets.length} notable wallets found\n`;
-            }
-        }
+        // Get top 5 bundle holders (by tokens bought in bundles)
+        const allBundleWallets = new Map();
         
-        section += '\n';
-        return section;
-    }
-
-    formatDevAnalysis(result) {
-        if (!result || !result.success) return '';
-        
-        let section = '👨‍💻 <b>Dev Analysis:</b>\n';
-        
-        if (result.coinsStats) {
-            const { totalCoins, bondedCount, bondedPercentage } = result.coinsStats;
-            section += `🏗️ Created ${totalCoins} tokens (${bondedPercentage}% bonded)\n`;
-            
-            if (bondedCount > 0) {
-                section += `✅ ${bondedCount} successful launches\n`;
-            }
-        }
-        
-        if (result.ownerTokenStats) {
-            const { holdingPercentage } = result.ownerTokenStats;
-            if (holdingPercentage > 0) {
-                section += `💼 Dev holds ${holdingPercentage}% of supply\n`;
-            }
-        }
-        
-        if (result.transferConnections && result.transferConnections.length > 0) {
-            const exchanges = result.transferConnections.filter(conn => conn.label);
-            if (exchanges.length > 0) {
-                section += `🏦 Connected to ${exchanges[0].label}\n`;
-            }
-        }
-        
-        section += '\n';
-        return section;
-    }
-
-    formatTeamSupplyAnalysis(result) {
-        if (!result?.scanData) return '';
-        
-        let section = '👨‍👨‍👧‍👦 <b>Team Supply:</b>\n';
-        section += `🎯 Team controls ${result.scanData.totalSupplyControlled?.toFixed(2)}% of supply\n`;
-        
-        if (result.scanData.teamWallets && result.scanData.teamWallets.length > 0) {
-            section += `👤 ${result.scanData.teamWallets.length} team wallets identified\n`;
-            
-            // Show breakdown by category
-            const categories = {};
-            result.scanData.teamWallets.forEach(wallet => {
-                categories[wallet.category] = (categories[wallet.category] || 0) + 1;
+        result.bundles.forEach(bundle => {
+            bundle.transactions.forEach(tx => {
+                const wallet = tx.user;
+                const tokens = tx.token_amount / 1000000; // Convert from raw to tokens
+                allBundleWallets.set(wallet, (allBundleWallets.get(wallet) || 0) + tokens);
             });
-            
-            Object.entries(categories).forEach(([category, count]) => {
-                section += `   • ${count} ${category.toLowerCase()} wallet${count > 1 ? 's' : ''}\n`;
+        });
+        
+        // Sort by tokens held and get top 5
+        const topHolders = Array.from(allBundleWallets.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5);
+        
+        let summary = `<b>Bundle Summary:</b>\n`;
+        summary += `Total Bundle Transactions: ${totalTransactions}\n`;
+        summary += `Total Bought: ${totalBoughtPercentage.toFixed(2)}%\n`;
+        summary += `Currently Held: ${currentlyHeldPercentage.toFixed(2)}%\n`;
+        
+        if (topHolders.length > 0) {
+            summary += `Top 5 addresses: `;
+            const addressLinks = topHolders.map(([wallet, tokens]) => {
+                const shortWallet = `${wallet.substring(0, 5)}...${wallet.substring(wallet.length - 4)}`;
+                return `<a href="https://solscan.io/account/${wallet}">${shortWallet}</a>`;
             });
+            summary += addressLinks.join(', ');
         }
         
-        section += '\n';
-        return section;
+        return summary + '\n';
     }
 
-    formatFreshWalletsAnalysis(result) {
-        if (!result?.scanData) return '';
-        
-        let section = '🆕 <b>Fresh Wallets:</b>\n';
-        section += `🎯 Fresh wallets hold ${result.scanData.totalSupplyControlled?.toFixed(2)}% of supply\n`;
-        
-        if (result.scanData.freshWallets && result.scanData.freshWallets.length > 0) {
-            section += `👶 ${result.scanData.freshWallets.length} fresh wallets found\n`;
-            
-            // Show top fresh wallets by percentage
-            const topFresh = result.scanData.freshWallets
-                .sort((a, b) => b.percentage - a.percentage)
-                .slice(0, 3);
-                
-            topFresh.forEach(wallet => {
-                section += `   • ${wallet.percentage.toFixed(2)}% supply\n`;
-            });
-        }
-        
-        section += '\n';
-        return section;
-    }
-
-    formatFooter(tokenAddress, operationId) {
+    formatFooter(tokenAddress, operationId, twitterLink) {
         let footer = '<b>🔗 Links:</b>\n';
+        footer += `🐦 <a href="${twitterLink}">Tweet</a> | `;
         footer += `📈 <a href="https://dexscreener.com/solana/${tokenAddress}">DexScreener</a> | `;
         footer += `🔥 <a href="https://pump.fun/${tokenAddress}">Pump.fun</a> | `;
         footer += `📊 <a href="https://solscan.io/token/${tokenAddress}">Solscan</a>\n\n`;
@@ -307,7 +191,7 @@ class TelegramPublisher {
 
         const sendOptions = {
             parse_mode: 'HTML',
-            disable_web_page_preview: !this.config.enablePreviews,
+            disable_web_page_preview: true, // Always disable previews to avoid embedded links
             ...options
         };
 
@@ -326,26 +210,6 @@ class TelegramPublisher {
                     throw error;
                 }
             }
-        }
-    }
-
-    async sendPhoto(channelId, photo, caption = '', options = {}) {
-        if (!this.bot) {
-            logger.warn('Telegram bot not initialized');
-            return;
-        }
-
-        const sendOptions = {
-            caption,
-            parse_mode: 'HTML',
-            ...options
-        };
-
-        try {
-            return await this.bot.sendPhoto(channelId, photo, sendOptions);
-        } catch (error) {
-            logger.error(`Failed to send photo to ${channelId}:`, error);
-            throw error;
         }
     }
 
@@ -394,4 +258,4 @@ class TelegramPublisher {
     }
 }
 
-module.exports = TelegramPublisher;;
+module.exports = TelegramPublisher;

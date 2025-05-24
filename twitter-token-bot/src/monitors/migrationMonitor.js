@@ -1,4 +1,4 @@
-// src/monitors/migrationMonitor.js - Separate Migration Monitor
+// src/monitors/migrationMonitor.js - Updated with bot type configuration
 const EventEmitter = require('events');
 const axios = require('axios');
 const logger = require('../utils/logger');
@@ -28,7 +28,13 @@ class MigrationMonitor extends EventEmitter {
         logger.info(`   • Telegram Channels: ${this.config.telegram.channels ? this.config.telegram.channels.length : 0}`);
 
         this.twitterValidator = new TwitterValidator();
-        this.analysisOrchestrator = new AnalysisOrchestrator(this.config);
+        
+        // Pass bot type to analysis orchestrator
+        this.analysisOrchestrator = new AnalysisOrchestrator({
+            ...this.config,
+            botType: 'migration' // This monitor handles migration events
+        });
+        
         this.solanaApi = getSolanaApi();
         
         this.processedTokens = new Set();
@@ -313,7 +319,7 @@ class MigrationMonitor extends EventEmitter {
             }
 
             // For migrations, analyze regardless of Twitter metrics
-            logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} graduated to Raydium! Starting bundle analysis...`);
+            logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} graduated to Raydium! Starting analysis...`);
             
             await this.triggerAnalysis(tokenEvent, twitterMetrics, operationId);
 
@@ -354,7 +360,7 @@ class MigrationMonitor extends EventEmitter {
             });
 
             if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Migration bundle analysis completed successfully for ${tokenEvent.symbol}`);
+                logger.info(`✅ [${operationId}] Migration analysis completed successfully for ${tokenEvent.symbol}`);
                 this.stats.analysesCompleted++;
                 
                 this.emit('analysisCompleted', {
@@ -364,7 +370,7 @@ class MigrationMonitor extends EventEmitter {
                     operationId
                 });
             } else {
-                logger.error(`❌ [${operationId}] Migration bundle analysis failed for ${tokenEvent.symbol}:`, analysisResult.error);
+                logger.error(`❌ [${operationId}] Migration analysis failed for ${tokenEvent.symbol}:`, analysisResult.error);
                 this.stats.errors++;
             }
 
@@ -378,14 +384,15 @@ class MigrationMonitor extends EventEmitter {
 
     getStatus() {
         return {
-            mode: 'migration-only',
+            botType: 'migration',
             processedTokensCount: this.processedTokens.size,
             queueLength: this.processingQueue.length,
             currentlyAnalyzing: this.currentlyAnalyzing.size,
             maxConcurrentAnalyses: this.config.maxConcurrentAnalyses,
             isProcessing: this.isProcessing,
             stats: this.stats,
-            config: this.config
+            config: this.config,
+            enabledAnalyses: this.analysisOrchestrator.getEnabledAnalyses()
         };
     }
 

@@ -146,9 +146,11 @@ class PumpFunUnifiedApp {
             throw new Error(`Invalid BOT_MODE: ${this.botMode}. Must be 'creation', 'migration', or 'both'`);
         }
 
-        // Validate Twitter configuration
+        // Check Twitter configuration (optional since we use scraping)
         if (!process.env.TWITTER_BEARER_TOKEN && !process.env.X_BEARER_TOKEN) {
-            logger.warn('⚠️ No Twitter API credentials found - engagement validation may be limited');
+            logger.info('ℹ️  No Twitter API credentials found - using web scraping method for engagement validation');
+        } else {
+            logger.info('ℹ️  Twitter API credentials found - API method available for engagement validation');
         }
 
         // Validate Telegram configuration based on mode

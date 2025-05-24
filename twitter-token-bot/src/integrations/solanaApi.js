@@ -1,4 +1,4 @@
-// src/integrations/solanaApi.js
+// src/integrations/solanaApi.js - Updated with getTokenAccountsByOwner method
 const axios = require('axios');
 const logger = require('../utils/logger');
 const BigNumber = require('bignumber.js');
@@ -139,6 +139,30 @@ class SolanaApi {
         } catch (error) {
             logger.error(`Error getting account info for ${address}:`, error);
             return null;
+        }
+    }
+
+    async getTokenAccountsByOwner(ownerAddress, tokenMintAddress, config = { encoding: 'jsonParsed' }) {
+        try {
+            const params = [
+                ownerAddress,
+                {
+                    mint: tokenMintAddress
+                },
+                config
+            ];
+
+            const result = await this.callHelius('getTokenAccountsByOwner', params);
+            
+            if (!result || !result.value) {
+                logger.debug(`No token accounts found for owner ${ownerAddress} and mint ${tokenMintAddress}`);
+                return [];
+            }
+            
+            return result.value;
+        } catch (error) {
+            logger.error(`Error getting token accounts for owner ${ownerAddress}:`, error);
+            return [];
         }
     }
 

@@ -1,19 +1,36 @@
-// src/orchestrators/analysisOrchestrator.js
+// src/orchestrators/analysisOrchestrator.js - Updated with configurable analyses
 const logger = require('../utils/logger');
 const BundleAnalyzer = require('../analysis/bundleAnalyzer');
 const TelegramPublisher = require('../publishers/telegramPublisher');
+const analysisConfig = require('../config/analysisConfig');
 
 class AnalysisOrchestrator {
     constructor(config = {}) {
+        this.botType = config.botType || 'creation'; // 'creation' or 'migration'
         this.config = {
-            analysisTimeout: config.analysisTimeout || 5 * 60 * 1000, // 5 minutes
-            enabledAnalyses: ['bundle'], // Only bundle analysis
             publishResults: config.publishResults !== false,
+            telegram: config.telegram || {},
             ...config
         };
 
-        this.bundleAnalyzer = BundleAnalyzer;
-        this.telegramPublisher = new TelegramPublisher(config.telegram || {});
+        // Get bot-specific analysis configuration
+        this.analysisConfig = analysisConfig.getConfigForBot(this.botType);
+        
+        logger.info(`🔬 Analysis Orchestrator initialized for ${this.botType} bot`);
+        logger.info(`   • Enabled analyses: ${this.analysisConfig.enabledAnalyses.join(', ')}`);
+        logger.info(`   • Timeout: ${this.analysisConfig.timeout / 1000}s`);
+        logger.info(`   • Max concurrent: ${this.analysisConfig.maxConcurrent}`);
+
+        // Initialize analyzers (we'll add more as we create them)
+        this.analyzers = {
+            bundle: BundleAnalyzer,
+            // topHolders: TopHoldersAnalyzer,     // To be implemented
+            // freshWallets: FreshWalletAnalyzer,  // To be implemented
+            // devAnalysis: DevAnalyzer,           // To be implemented
+            // teamSupply: TeamSupplyAnalyzer,     // To be implemented
+        };
+
+        this.telegramPublisher = new TelegramPublisher(this.config.telegram);
         
         // Analysis state
         this.activeAnalyses = new Map();
@@ -23,13 +40,15 @@ class AnalysisOrchestrator {
     async analyzeToken(tokenData) {
         const { tokenAddress, tokenInfo, twitterMetrics, operationId } = tokenData;
         
-        logger.info(`🔬 [${operationId}] Starting bundle analysis for ${tokenInfo.symbol} (${tokenAddress})`);
+        logger.info(`🔬 [${operationId}] Starting ${this.botType} analysis for ${tokenInfo.symbol} (${tokenAddress})`);
+        logger.debug(`[${operationId}] Enabled analyses: ${this.analysisConfig.enabledAnalyses.join(', ')}`);
         
         const analysisResult = {
             tokenAddress,
             tokenInfo,
             twitterMetrics,
             operationId,
+            botType: this.botType,
             startTime: Date.now(),
             success: false,
             analyses: {},
@@ -38,48 +57,65 @@ class AnalysisOrchestrator {
         };
 
         // Create cancellation token for timeout handling
-        const cancellationToken = this.createCancellationToken(this.config.analysisTimeout);
+        const cancellationToken = this.createCancellationToken(this.analysisConfig.timeout);
         this.activeAnalyses.set(operationId, cancellationToken);
 
         try {
-            // Run bundle analysis only
-            const bundleAnalysis = await this.runAnalysisWithTimeout(
-                'bundle',
-                () => this.bundleAnalyzer.analyzeBundle(tokenAddress, 50000),
-                operationId,
-                cancellationToken
+            // Run enabled analyses
+            const analysisPromises = this.analysisConfig.enabledAnalyses.map(analysisType => 
+                this.runSingleAnalysis(analysisType, tokenAddress, operationId, cancellationToken)
             );
 
+            const analysisResults = await Promise.allSettled(analysisPromises);
+
             // Process results
-            analysisResult.analyses.bundle = bundleAnalysis;
-            
-            if (!bundleAnalysis.success) {
-                analysisResult.errors.push(`bundle: ${bundleAnalysis.error}`);
-            }
+            let successfulAnalyses = 0;
+            analysisResults.forEach((result, index) => {
+                const analysisType = this.analysisConfig.enabledAnalyses[index];
+                
+                if (result.status === 'fulfilled') {
+                    analysisResult.analyses[analysisType] = result.value;
+                    if (result.value.success) {
+                        successfulAnalyses++;
+                    } else {
+                        analysisResult.errors.push(`${analysisType}: ${result.value.error}`);
+                    }
+                } else {
+                    analysisResult.analyses[analysisType] = {
+                        type: analysisType,
+                        success: false,
+                        result: null,
+                        error: result.reason.message,
+                        duration: 0
+                    };
+                    analysisResult.errors.push(`${analysisType}: ${result.reason.message}`);
+                }
+            });
             
             // Generate summary
             this.generateAnalysisSummary(analysisResult);
             
-            // Determine if analysis was successful
-            analysisResult.success = bundleAnalysis.success;
+            // Determine if analysis was successful (at least one analysis succeeded)
+            analysisResult.success = successfulAnalyses > 0;
             analysisResult.endTime = Date.now();
             analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
 
             if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Bundle analysis completed successfully in ${analysisResult.duration}ms`);
+                logger.info(`✅ [${operationId}] ${this.botType} analysis completed successfully in ${analysisResult.duration}ms`);
+                logger.info(`   • Successful analyses: ${successfulAnalyses}/${this.analysisConfig.enabledAnalyses.length}`);
                 
                 // Publish results if enabled
                 if (this.config.publishResults) {
                     await this.publishResults(analysisResult);
                 }
             } else {
-                logger.warn(`⚠️ [${operationId}] Bundle analysis failed`);
+                logger.warn(`⚠️ [${operationId}] ${this.botType} analysis failed - no successful analyses`);
             }
 
             return analysisResult;
 
         } catch (error) {
-            logger.error(`❌ [${operationId}] Analysis failed:`, error);
+            logger.error(`❌ [${operationId}] ${this.botType} analysis failed:`, error);
             analysisResult.error = error.message;
             analysisResult.endTime = Date.now();
             analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
@@ -94,16 +130,24 @@ class AnalysisOrchestrator {
         }
     }
 
-    async runAnalysisWithTimeout(analysisType, analysisFunction, operationId, cancellationToken) {
+    async runSingleAnalysis(analysisType, tokenAddress, operationId, cancellationToken) {
         const startTime = Date.now();
         logger.debug(`[${operationId}] Starting ${analysisType} analysis`);
 
         try {
+            // Check if analyzer exists
+            if (!this.analyzers[analysisType]) {
+                throw new Error(`Analyzer not implemented: ${analysisType}`);
+            }
+
+            // Get analysis-specific thresholds
+            const thresholds = analysisConfig.getAnalysisThresholds(this.botType, analysisType);
+            
             // Create timeout promise
             const timeoutPromise = new Promise((_, reject) => {
                 const timeoutId = setTimeout(() => {
                     reject(new Error(`${analysisType} analysis timed out`));
-                }, this.config.analysisTimeout);
+                }, this.analysisConfig.timeout);
 
                 // Clear timeout if cancellation token is triggered
                 cancellationToken.onCancel(() => {
@@ -111,6 +155,29 @@ class AnalysisOrchestrator {
                     reject(new Error(`${analysisType} analysis cancelled`));
                 });
             });
+
+            // Run the specific analysis with thresholds
+            let analysisFunction;
+            
+            switch (analysisType) {
+                case 'bundle':
+                    analysisFunction = () => this.analyzers.bundle.analyzeBundle(tokenAddress, 50000);
+                    break;
+                case 'topHolders':
+                    // analysisFunction = () => this.analyzers.topHolders.analyzeTopHolders(tokenAddress, thresholds);
+                    throw new Error('Top holders analysis not yet implemented');
+                case 'freshWallets':
+                    // analysisFunction = () => this.analyzers.freshWallets.analyzeFreshWallets(tokenAddress, thresholds);
+                    throw new Error('Fresh wallets analysis not yet implemented');
+                case 'devAnalysis':
+                    // analysisFunction = () => this.analyzers.devAnalysis.analyzeDevActivity(tokenAddress, thresholds);
+                    throw new Error('Dev analysis not yet implemented');
+                case 'teamSupply':
+                    // analysisFunction = () => this.analyzers.teamSupply.analyzeTeamSupply(tokenAddress, thresholds);
+                    throw new Error('Team supply analysis not yet implemented');
+                default:
+                    throw new Error(`Unknown analysis type: ${analysisType}`);
+            }
 
             // Race between analysis and timeout
             const result = await Promise.race([
@@ -144,35 +211,59 @@ class AnalysisOrchestrator {
     }
 
     generateAnalysisSummary(analysisResult) {
-        const bundleAnalysis = analysisResult.analyses.bundle;
+        const analyses = analysisResult.analyses;
+        const enabledAnalyses = this.analysisConfig.enabledAnalyses;
         
         const summary = {
-            totalAnalyses: 1,
-            successfulAnalyses: bundleAnalysis.success ? 1 : 0,
-            failedAnalyses: bundleAnalysis.success ? 0 : 1,
+            botType: this.botType,
+            totalAnalyses: enabledAnalyses.length,
+            successfulAnalyses: 0,
+            failedAnalyses: 0,
             flags: [],
-            scores: {}
+            scores: {},
+            enabledAnalyses: enabledAnalyses
         };
 
-        // Add bundle-specific flags and scores
-        if (bundleAnalysis.success && bundleAnalysis.result) {
-            const result = bundleAnalysis.result;
+        // Process each analysis result
+        enabledAnalyses.forEach(analysisType => {
+            const analysis = analyses[analysisType];
             
-            // Add flags
-            if (result.bundleDetected) {
-                summary.flags.push(`🔴 Bundle detected: ${result.percentageBundled?.toFixed(2)}% of supply`);
+            if (analysis && analysis.success) {
+                summary.successfulAnalyses++;
+                
+                // Add type-specific flags and scores
+                switch (analysisType) {
+                    case 'bundle':
+                        this.processBundleResults(analysis.result, summary);
+                        break;
+                    case 'topHolders':
+                        // this.processTopHoldersResults(analysis.result, summary);
+                        break;
+                    case 'freshWallets':
+                        // this.processFreshWalletsResults(analysis.result, summary);
+                        break;
+                    // Add more cases as we implement more analyses
+                }
+            } else {
+                summary.failedAnalyses++;
             }
-            
-            // Calculate score
-            summary.scores.bundle = result.bundleDetected ? 0 : 100;
-            summary.overallScore = summary.scores.bundle;
-            summary.riskLevel = this.determineRiskLevel(summary.overallScore);
-        } else {
-            summary.overallScore = 0;
-            summary.riskLevel = 'UNKNOWN';
-        }
+        });
+
+        // Calculate overall score (average of successful analyses)
+        const scores = Object.values(summary.scores);
+        summary.overallScore = scores.length > 0 ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0;
+        summary.riskLevel = this.determineRiskLevel(summary.overallScore);
 
         analysisResult.summary = summary;
+    }
+
+    processBundleResults(bundleResult, summary) {
+        if (bundleResult && bundleResult.bundleDetected) {
+            summary.flags.push(`🔴 Bundle detected: ${bundleResult.percentageBundled?.toFixed(2)}% of supply`);
+            summary.scores.bundle = Math.max(0, 100 - bundleResult.percentageBundled * 2); // Lower score for more bundling
+        } else {
+            summary.scores.bundle = 100; // Perfect score if no bundling
+        }
     }
 
     determineRiskLevel(score) {
@@ -184,7 +275,7 @@ class AnalysisOrchestrator {
 
     async publishResults(analysisResult) {
         try {
-            logger.info(`📤 [${analysisResult.operationId}] Publishing bundle analysis results`);
+            logger.info(`📤 [${analysisResult.operationId}] Publishing ${this.botType} analysis results`);
             await this.telegramPublisher.publishAnalysis(analysisResult);
         } catch (error) {
             logger.error(`Failed to publish results for ${analysisResult.operationId}:`, error);
@@ -239,11 +330,13 @@ class AnalysisOrchestrator {
 
     getStatus() {
         return {
+            botType: this.botType,
             activeAnalyses: this.activeAnalyses.size,
             completedAnalyses: this.completedAnalyses.size,
-            enabledAnalyses: this.config.enabledAnalyses,
+            enabledAnalyses: this.analysisConfig.enabledAnalyses,
             config: {
-                analysisTimeout: this.config.analysisTimeout,
+                timeout: this.analysisConfig.timeout,
+                maxConcurrent: this.analysisConfig.maxConcurrent,
                 publishResults: this.config.publishResults
             }
         };
@@ -259,10 +352,20 @@ class AnalysisOrchestrator {
         const cancellationToken = this.activeAnalyses.get(operationId);
         if (cancellationToken) {
             cancellationToken.cancel();
-            logger.info(`Cancelled analysis ${operationId}`);
+            logger.info(`Cancelled ${this.botType} analysis ${operationId}`);
             return true;
         }
         return false;
+    }
+
+    // Check if specific analysis is enabled
+    isAnalysisEnabled(analysisType) {
+        return this.analysisConfig.enabledAnalyses.includes(analysisType);
+    }
+
+    // Get enabled analyses list
+    getEnabledAnalyses() {
+        return [...this.analysisConfig.enabledAnalyses];
     }
 }
 

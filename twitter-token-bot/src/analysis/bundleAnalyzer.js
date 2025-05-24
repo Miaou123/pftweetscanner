@@ -1,4 +1,4 @@
-// src/analysis/bundleAnalyzer.js - Updated to match working bot
+// src/analysis/bundleAnalyzer.js - Fixed with correct SolanaApi method call
 const pumpfunApi = require('../integrations/pumpfunApi');
 const { getSolanaApi } = require('../integrations/solanaApi');
 const logger = require('../utils/logger');
@@ -209,6 +209,7 @@ class BundleAnalyzer {
                 const holdingAmounts = await Promise.all(
                     bundle.uniqueWallets.map(async (wallet) => {
                         try {
+                            // Fixed: Use the correct method signature
                             const tokenAccounts = await getSolanaApi().getTokenAccountsByOwner(wallet, tokenInfo.address);
                             
                             const walletHolding = tokenAccounts.reduce((sum, account) => {

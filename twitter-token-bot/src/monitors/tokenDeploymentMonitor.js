@@ -3,7 +3,6 @@ const EventEmitter = require('events');
 const logger = require('../utils/logger');
 const TwitterValidator = require('../validators/twitterValidator');
 const AnalysisOrchestrator = require('../orchestrators/analysisOrchestrator');
-const { DeploymentService } = require('../database');
 
 class TokenDeploymentMonitor extends EventEmitter {
     constructor(config = {}) {
@@ -19,13 +18,18 @@ class TokenDeploymentMonitor extends EventEmitter {
 
         this.twitterValidator = new TwitterValidator();
         this.analysisOrchestrator = new AnalysisOrchestrator(this.config);
-        this.deploymentService = new DeploymentService();
         
-        // Processing state
+        // Processing state (in-memory only)
         this.processedTokens = new Set();
         this.processingQueue = [];
         this.currentlyAnalyzing = new Set();
         this.isProcessing = false;
+        this.stats = {
+            tokensProcessed: 0,
+            tokensAnalyzed: 0,
+            tokensSkipped: 0,
+            errors: 0
+        };
 
         // Bind methods
         this.processNewToken = this.processNewToken.bind(this);
@@ -33,21 +37,27 @@ class TokenDeploymentMonitor extends EventEmitter {
         
         // Start queue processing
         this.startQueueProcessor();
+        
+        // Clean up processed tokens periodically to prevent memory leaks
+        this.startMemoryCleanup();
     }
 
     async processNewToken(tokenEvent) {
         try {
             logger.info(`🔍 Processing new token: ${tokenEvent.name} (${tokenEvent.symbol}) - ${tokenEvent.mint}`);
+            this.stats.tokensProcessed++;
             
             // Validate required fields
             if (!this.validateTokenEvent(tokenEvent)) {
                 logger.warn(`Invalid token event structure for ${tokenEvent.mint}`);
+                this.stats.tokensSkipped++;
                 return;
             }
 
             // Check for duplicates
             if (this.processedTokens.has(tokenEvent.mint)) {
                 logger.debug(`Token ${tokenEvent.mint} already processed, skipping`);
+                this.stats.tokensSkipped++;
                 return;
             }
 
@@ -55,12 +65,10 @@ class TokenDeploymentMonitor extends EventEmitter {
             this.processedTokens.add(tokenEvent.mint);
 
             // Extract and validate Twitter link
-            const twitterLink = this.extractTwitterLink(tokenEvent);
+            const twitterLink = await this.extractTwitterLink(tokenEvent);
             if (!twitterLink) {
                 logger.debug(`No Twitter link found for ${tokenEvent.symbol} (${tokenEvent.mint})`);
-                
-                // Save deployment without Twitter info
-                await this.saveDeployment(tokenEvent, null, 'no_twitter_link');
+                this.stats.tokensSkipped++;
                 return;
             }
 
@@ -77,13 +85,7 @@ class TokenDeploymentMonitor extends EventEmitter {
 
         } catch (error) {
             logger.error(`Error processing new token ${tokenEvent.mint}:`, error);
-            
-            // Save deployment with error status
-            try {
-                await this.saveDeployment(tokenEvent, null, 'processing_error', error.message);
-            } catch (saveError) {
-                logger.error(`Failed to save deployment with error status:`, saveError);
-            }
+            this.stats.errors++;
         }
     }
 
@@ -94,61 +96,74 @@ class TokenDeploymentMonitor extends EventEmitter {
         );
     }
 
-    extractTwitterLink(tokenEvent) {
-        // Check multiple possible fields for Twitter links
+    async extractTwitterLink(tokenEvent) {
+        console.log('🔍 EXTRACTING TWITTER LINK FOR:', tokenEvent.symbol);
+        console.log('   - Checking direct fields first...');
+        
+        // First check if there are any social fields directly
         const possibleFields = [
             'twitter',
             'social',
-            'socials', 
-            'uri',
-            'metadata',
-            'description'
+            'socials'
         ];
-
+    
         for (const field of possibleFields) {
             if (tokenEvent[field]) {
+                console.log(`   - Found direct field '${field}':`, tokenEvent[field]);
                 const twitterLink = this.findTwitterUrl(tokenEvent[field]);
-                if (twitterLink) return twitterLink;
+                if (twitterLink) {
+                    console.log(`   - ✅ Twitter link found in direct field: ${twitterLink}`);
+                    return twitterLink;
+                }
             }
         }
-
-        // If uri field exists, try to fetch metadata
+    
+        // If uri field exists, try to fetch metadata from IPFS/Arweave
         if (tokenEvent.uri) {
-            return this.extractTwitterFromUri(tokenEvent.uri);
+            console.log(`   - No direct fields, fetching metadata from URI: ${tokenEvent.uri}`);
+            const result = await this.extractTwitterFromUri(tokenEvent.uri);
+            if (result) {
+                console.log(`   - ✅ Twitter link found in metadata: ${result}`);
+                return result;
+            } else {
+                console.log(`   - ❌ No Twitter link found in metadata`);
+            }
+        } else {
+            console.log(`   - ❌ No URI field found`);
         }
-
+    
+        console.log(`   - ❌ No Twitter link found for ${tokenEvent.symbol}`);
         return null;
     }
-
+    
     findTwitterUrl(text) {
         if (!text || typeof text !== 'string') return null;
         
-        // Twitter URL patterns
+        // Twitter URL patterns - more comprehensive
         const twitterPatterns = [
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/\w+\/status\/\d+/gi,
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/\w+/gi
+            // Full status URLs
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi,
+            // Profile URLs that might contain status links
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/gi,
+            // Just status URLs without domain
+            /\/status\/\d+/gi,
+            /\/statuses\/\d+/gi
         ];
 
         for (const pattern of twitterPatterns) {
-            const match = text.match(pattern);
-            if (match) return match[0];
+            const matches = text.match(pattern);
+            if (matches) {
+                // Return the first match, preferring status URLs over profile URLs
+                const statusUrls = matches.filter(url => url.includes('/status/') || url.includes('/statuses/'));
+                if (statusUrls.length > 0) {
+                    return statusUrls[0];
+                }
+                return matches[0];
+            }
         }
 
         return null;
-    }
-
-    async extractTwitterFromUri(uri) {
-        try {
-            // This would fetch metadata from IPFS/Arweave URIs
-            // Implementation depends on your metadata fetching logic
-            logger.debug(`Attempting to extract Twitter from URI: ${uri}`);
-            
-            // For now, return null - implement based on your metadata structure
-            return null;
-        } catch (error) {
-            logger.debug(`Failed to extract Twitter from URI ${uri}:`, error.message);
-            return null;
-        }
     }
 
     startQueueProcessor() {
@@ -159,6 +174,15 @@ class TokenDeploymentMonitor extends EventEmitter {
         }, this.config.processingDelay);
 
         logger.info(`Queue processor started with ${this.config.processingDelay}ms interval`);
+    }
+
+    startMemoryCleanup() {
+        // Clean up processed tokens every 10 minutes to prevent memory leaks
+        setInterval(() => {
+            this.clearProcessedTokens();
+        }, 10 * 60 * 1000);
+
+        logger.info('Memory cleanup process started');
     }
 
     async processQueue() {
@@ -181,6 +205,7 @@ class TokenDeploymentMonitor extends EventEmitter {
 
         } catch (error) {
             logger.error('Error processing queue:', error);
+            this.stats.errors++;
         } finally {
             this.isProcessing = false;
         }
@@ -193,10 +218,10 @@ class TokenDeploymentMonitor extends EventEmitter {
         try {
             logger.info(`🔄 [${operationId}] Processing queued token: ${tokenEvent.symbol}`);
 
-            // Check if too much time has passed
-            if (Date.now() - timestamp > 10 * 60 * 1000) { // 10 minutes
-                logger.warn(`[${operationId}] Item too old, skipping: ${tokenEvent.symbol}`);
-                await this.saveDeployment(tokenEvent, null, 'expired');
+            // Check if too much time has passed (10 minutes)
+            if (Date.now() - timestamp > 10 * 60 * 1000) {
+                logger.warn(`[${operationId}] Token too old, skipping: ${tokenEvent.symbol}`);
+                this.stats.tokensSkipped++;
                 return;
             }
 
@@ -205,38 +230,27 @@ class TokenDeploymentMonitor extends EventEmitter {
             
             if (!twitterMetrics) {
                 logger.info(`[${operationId}] Failed to get Twitter metrics for ${tokenEvent.symbol}`);
-                await this.saveDeployment(tokenEvent, { link: twitterLink }, 'twitter_validation_failed');
+                this.stats.tokensSkipped++;
                 return;
             }
 
             logger.info(`[${operationId}] Twitter metrics for ${tokenEvent.symbol}: ${twitterMetrics.views} views, ${twitterMetrics.likes} likes`);
 
-            // Save deployment with Twitter metrics
-            await this.saveDeployment(tokenEvent, {
-                link: twitterLink,
-                ...twitterMetrics
-            }, 'twitter_validated');
-
             // Check if meets engagement threshold
             if (twitterMetrics.views < this.config.minTwitterViews) {
                 logger.info(`[${operationId}] ${tokenEvent.symbol} has ${twitterMetrics.views} views (< ${this.config.minTwitterViews}), skipping analysis`);
-                await this.updateDeploymentStatus(tokenEvent.mint, 'below_threshold');
+                this.stats.tokensSkipped++;
                 return;
             }
 
             // Token meets criteria - trigger analysis
-            logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} meets criteria (${twitterMetrics.views} views)! Starting comprehensive analysis...`);
+            logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} meets criteria (${twitterMetrics.views} views)! Starting bundle analysis...`);
             
             await this.triggerAnalysis(tokenEvent, twitterMetrics, operationId);
 
         } catch (error) {
             logger.error(`[${operationId}] Error processing queue item:`, error);
-            
-            try {
-                await this.saveDeployment(tokenEvent, { link: twitterLink }, 'processing_error', error.message);
-            } catch (saveError) {
-                logger.error(`Failed to save error status for ${tokenEvent.symbol}:`, saveError);
-            }
+            this.stats.errors++;
         }
     }
 
@@ -246,7 +260,11 @@ class TokenDeploymentMonitor extends EventEmitter {
             logger.warn(`[${operationId}] Maximum concurrent analyses reached, queuing for later`);
             // Re-queue for later processing
             setTimeout(() => {
-                this.processingQueue.unshift({ tokenEvent, twitterLink: twitterMetrics.link, timestamp: Date.now() });
+                this.processingQueue.unshift({ 
+                    tokenEvent, 
+                    twitterLink: twitterMetrics.link, 
+                    timestamp: Date.now() 
+                });
             }, 30000); // Retry in 30 seconds
             return;
         }
@@ -254,10 +272,7 @@ class TokenDeploymentMonitor extends EventEmitter {
         this.currentlyAnalyzing.add(tokenEvent.mint);
 
         try {
-            // Update status to analyzing
-            await this.updateDeploymentStatus(tokenEvent.mint, 'analyzing');
-
-            // Start comprehensive analysis
+            // Start bundle analysis
             const analysisResult = await this.analysisOrchestrator.analyzeToken({
                 tokenAddress: tokenEvent.mint,
                 tokenInfo: {
@@ -270,8 +285,8 @@ class TokenDeploymentMonitor extends EventEmitter {
             });
 
             if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Analysis completed successfully for ${tokenEvent.symbol}`);
-                await this.updateDeploymentStatus(tokenEvent.mint, 'analysis_completed', null, analysisResult);
+                logger.info(`✅ [${operationId}] Bundle analysis completed successfully for ${tokenEvent.symbol}`);
+                this.stats.tokensAnalyzed++;
                 
                 // Emit success event for external listeners
                 this.emit('analysisCompleted', {
@@ -281,53 +296,15 @@ class TokenDeploymentMonitor extends EventEmitter {
                     operationId
                 });
             } else {
-                logger.error(`❌ [${operationId}] Analysis failed for ${tokenEvent.symbol}:`, analysisResult.error);
-                await this.updateDeploymentStatus(tokenEvent.mint, 'analysis_failed', analysisResult.error);
+                logger.error(`❌ [${operationId}] Bundle analysis failed for ${tokenEvent.symbol}:`, analysisResult.error);
+                this.stats.errors++;
             }
 
         } catch (error) {
             logger.error(`[${operationId}] Analysis orchestration error:`, error);
-            await this.updateDeploymentStatus(tokenEvent.mint, 'analysis_error', error.message);
+            this.stats.errors++;
         } finally {
             this.currentlyAnalyzing.delete(tokenEvent.mint);
-        }
-    }
-
-    async saveDeployment(tokenEvent, twitterData, status, errorMessage = null) {
-        try {
-            const deployment = {
-                mint: tokenEvent.mint,
-                name: tokenEvent.name,
-                symbol: tokenEvent.symbol,
-                creator: tokenEvent.traderPublicKey || tokenEvent.creator,
-                timestamp: new Date(tokenEvent.timestamp || Date.now()),
-                twitterLink: twitterData?.link || null,
-                twitterViews: twitterData?.views || null,
-                twitterLikes: twitterData?.likes || null,
-                twitterRetweets: twitterData?.retweets || null,
-                status,
-                errorMessage,
-                metadata: {
-                    uri: tokenEvent.uri,
-                    marketCapSOL: tokenEvent.marketCapSol,
-                    virtualTokenReserves: tokenEvent.virtualTokenReserves,
-                    virtualSolReserves: tokenEvent.virtualSolReserves
-                }
-            };
-
-            await this.deploymentService.saveDeployment(deployment);
-            logger.debug(`Saved deployment for ${tokenEvent.symbol} with status: ${status}`);
-
-        } catch (error) {
-            logger.error(`Failed to save deployment for ${tokenEvent.symbol}:`, error);
-        }
-    }
-
-    async updateDeploymentStatus(mint, status, errorMessage = null, analysisResult = null) {
-        try {
-            await this.deploymentService.updateDeploymentStatus(mint, status, errorMessage, analysisResult);
-        } catch (error) {
-            logger.error(`Failed to update deployment status for ${mint}:`, error);
         }
     }
 
@@ -338,16 +315,36 @@ class TokenDeploymentMonitor extends EventEmitter {
             currentlyAnalyzing: this.currentlyAnalyzing.size,
             maxConcurrentAnalyses: this.config.maxConcurrentAnalyses,
             isProcessing: this.isProcessing,
+            stats: this.stats,
             config: this.config
         };
     }
 
     clearProcessedTokens() {
         // Clear old entries to prevent memory issues
-        if (this.processedTokens.size > 10000) {
-            logger.info('Clearing processed tokens cache to prevent memory issues');
+        if (this.processedTokens.size > 5000) {
+            logger.info(`Clearing processed tokens cache (${this.processedTokens.size} entries) to prevent memory issues`);
             this.processedTokens.clear();
         }
+    }
+
+    // Get human-readable stats
+    getStatsString() {
+        const { tokensProcessed, tokensAnalyzed, tokensSkipped, errors } = this.stats;
+        const successRate = tokensProcessed > 0 ? ((tokensAnalyzed / tokensProcessed) * 100).toFixed(1) : 0;
+        
+        return `📊 Stats: ${tokensProcessed} processed | ${tokensAnalyzed} analyzed | ${tokensSkipped} skipped | ${errors} errors | ${successRate}% success rate`;
+    }
+
+    // Reset stats (useful for monitoring)
+    resetStats() {
+        this.stats = {
+            tokensProcessed: 0,
+            tokensAnalyzed: 0,
+            tokensSkipped: 0,
+            errors: 0
+        };
+        logger.info('Statistics reset');
     }
 }
 

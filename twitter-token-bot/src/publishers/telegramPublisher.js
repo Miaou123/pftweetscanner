@@ -1,6 +1,6 @@
 // src/publishers/telegramPublisher.js
 const logger = require('../utils/logger');
-const { formatNumber } = require('../bot/formatters/generalFormatters');
+const { formatNumber } = require('../utils/formatters');
 
 class TelegramPublisher {
     constructor(config = {}) {
@@ -52,19 +52,16 @@ class TelegramPublisher {
     formatAnalysisMessage(analysisResult) {
         const { tokenInfo, twitterMetrics, summary, analyses, operationId } = analysisResult;
         
-        // Header
+        // Header with token info
         let message = this.formatHeader(tokenInfo, twitterMetrics, summary);
         
-        // Risk assessment
-        message += this.formatRiskAssessment(summary);
-        
-        // Flags and warnings
-        if (summary.flags.length > 0) {
-            message += this.formatFlags(summary.flags);
+        // Bundle analysis results
+        if (analyses.bundle && analyses.bundle.success) {
+            message += this.formatBundleAnalysis(analyses.bundle.result);
         }
         
-        // Analysis details
-        message += this.formatAnalysisDetails(analyses);
+        // Risk assessment
+        message += this.formatRiskAssessment(analyses.bundle);
         
         // Links and footer
         message += this.formatFooter(tokenInfo.address || tokenInfo.mint, operationId);

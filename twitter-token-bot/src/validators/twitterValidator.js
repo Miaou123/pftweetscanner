@@ -1,4 +1,4 @@
-// src/validators/twitterValidator.js
+// src/validators/twitterValidator.js - Enhanced Scraping Version
 const axios = require('axios');
 const logger = require('../utils/logger');
 const { retryWithBackoff } = require('../utils/retryUtils');
@@ -6,26 +6,41 @@ const { retryWithBackoff } = require('../utils/retryUtils');
 class TwitterValidator {
     constructor(config = {}) {
         this.config = {
-            apiKey: process.env.TWITTER_API_KEY || process.env.X_API_KEY,
-            apiSecret: process.env.TWITTER_API_SECRET || process.env.X_API_SECRET,
-            bearerToken: process.env.TWITTER_BEARER_TOKEN || process.env.X_BEARER_TOKEN,
-            timeout: config.timeout || 10000,
+            timeout: config.timeout || 15000,
             maxRetries: config.maxRetries || 3,
-            rateLimitDelay: config.rateLimitDelay || 60000, // 1 minute
-            useEmbedMethod: config.useEmbedMethod !== false, // Default to true
+            userAgents: [
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ],
             ...config
         };
 
         this.rateLimitedUntil = 0;
         this.requestCount = 0;
-        this.lastResetTime = Date.now();
         
-        // Initialize axios instance
+        // Initialize axios instance with rotating user agents
         this.httpClient = axios.create({
             timeout: this.config.timeout,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Cache-Control': 'max-age=0'
             }
+        });
+
+        // Add request interceptor for rotating user agents
+        this.httpClient.interceptors.request.use((config) => {
+            const randomUA = this.config.userAgents[Math.floor(Math.random() * this.config.userAgents.length)];
+            config.headers['User-Agent'] = randomUA;
+            return config;
         });
     }
 
@@ -51,31 +66,27 @@ class TwitterValidator {
                 return null;
             }
 
-            // Try multiple methods to get tweet metrics
+            // Try multiple methods to get engagement metrics
             let metrics = null;
 
-            // Method 1: Use embed method (no API key required)
-            if (this.config.useEmbedMethod) {
-                metrics = await this.getMetricsFromEmbed(tweetId);
-                if (metrics) {
-                    logger.debug(`Got metrics from embed method: ${JSON.stringify(metrics)}`);
-                    return { link: twitterUrl, ...metrics };
-                }
+            // Method 1: Try X.com (new Twitter domain)
+            metrics = await this.scrapeFromX(tweetId);
+            if (metrics && metrics.views > 0) {
+                logger.debug(`Got metrics from X.com: ${JSON.stringify(metrics)}`);
+                return { link: twitterUrl, ...metrics };
             }
 
-            // Method 2: Use Twitter API v2 (requires bearer token)
-            if (this.config.bearerToken) {
-                metrics = await this.getMetricsFromAPI(tweetId);
-                if (metrics) {
-                    logger.debug(`Got metrics from API: ${JSON.stringify(metrics)}`);
-                    return { link: twitterUrl, ...metrics };
-                }
+            // Method 2: Try Twitter.com
+            metrics = await this.scrapeFromTwitter(tweetId);
+            if (metrics && metrics.views > 0) {
+                logger.debug(`Got metrics from Twitter.com: ${JSON.stringify(metrics)}`);
+                return { link: twitterUrl, ...metrics };
             }
 
-            // Method 3: Scraping method (fallback)
-            metrics = await this.getMetricsFromScraping(tweetId);
-            if (metrics) {
-                logger.debug(`Got metrics from scraping: ${JSON.stringify(metrics)}`);
+            // Method 3: Try embed method
+            metrics = await this.getMetricsFromEmbed(tweetId);
+            if (metrics && (metrics.views > 0 || metrics.likes > 0)) {
+                logger.debug(`Got metrics from embed: ${JSON.stringify(metrics)}`);
                 return { link: twitterUrl, ...metrics };
             }
 
@@ -91,8 +102,8 @@ class TwitterValidator {
     extractTweetId(url) {
         // Handle both twitter.com and x.com URLs
         const patterns = [
-            /(?:twitter\.com|x\.com)\/\w+\/status\/(\d+)/,
-            /(?:twitter\.com|x\.com)\/\w+\/statuses\/(\d+)/,
+            /(?:twitter\.com|x\.com)\/[\w]+\/status\/(\d+)/,
+            /(?:twitter\.com|x\.com)\/[\w]+\/statuses\/(\d+)/,
             /\/status\/(\d+)/,
             /\/statuses\/(\d+)/
         ];
@@ -103,6 +114,46 @@ class TwitterValidator {
         }
 
         return null;
+    }
+
+    async scrapeFromX(tweetId) {
+        try {
+            const url = `https://x.com/i/web/status/${tweetId}`;
+            
+            const response = await retryWithBackoff(
+                () => this.httpClient.get(url),
+                this.config.maxRetries
+            );
+
+            if (response.data) {
+                return this.parseMetricsFromHTML(response.data);
+            }
+
+            return null;
+        } catch (error) {
+            logger.debug(`X.com scraping failed for tweet ${tweetId}:`, error.message);
+            return null;
+        }
+    }
+
+    async scrapeFromTwitter(tweetId) {
+        try {
+            const url = `https://twitter.com/i/web/status/${tweetId}`;
+            
+            const response = await retryWithBackoff(
+                () => this.httpClient.get(url),
+                this.config.maxRetries
+            );
+
+            if (response.data) {
+                return this.parseMetricsFromHTML(response.data);
+            }
+
+            return null;
+        } catch (error) {
+            logger.debug(`Twitter.com scraping failed for tweet ${tweetId}:`, error.message);
+            return null;
+        }
     }
 
     async getMetricsFromEmbed(tweetId) {
@@ -125,8 +176,7 @@ class TwitterValidator {
         }
     }
 
-    parseEmbedMetrics(html) {
-        // This is a simplified parser - you might need to enhance based on actual HTML structure
+    parseMetricsFromHTML(html) {
         const metrics = {
             views: 0,
             likes: 0,
@@ -135,105 +185,65 @@ class TwitterValidator {
         };
 
         try {
-            // Look for view counts (this pattern may need adjustment)
-            const viewMatch = html.match(/(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*views?/i);
-            if (viewMatch) {
-                metrics.views = this.parseNumberString(viewMatch[1]);
+            // Look for view counts - multiple patterns as Twitter changes frequently
+            const viewPatterns = [
+                /(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*[Vv]iews?/gi,
+                /"viewCount":"(\d+)"/gi,
+                /viewcount['"]:[\s]*['"]?(\d+)/gi,
+                /views?['"]\s*:\s*[\s]*['"]?(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)/gi
+            ];
+
+            for (const pattern of viewPatterns) {
+                const matches = [...html.matchAll(pattern)];
+                if (matches.length > 0) {
+                    const viewStr = matches[0][1];
+                    metrics.views = this.parseNumberString(viewStr);
+                    if (metrics.views > 0) break;
+                }
             }
 
             // Look for like counts
-            const likeMatch = html.match(/(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*likes?/i);
-            if (likeMatch) {
-                metrics.likes = this.parseNumberString(likeMatch[1]);
+            const likePatterns = [
+                /"like_count":(\d+)/gi,
+                /"favoriteCount":"(\d+)"/gi,
+                /(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*[Ll]ikes?/gi,
+                /likes?['"]\s*:\s*[\s]*['"]?(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)/gi
+            ];
+
+            for (const pattern of likePatterns) {
+                const matches = [...html.matchAll(pattern)];
+                if (matches.length > 0) {
+                    const likeStr = matches[0][1];
+                    metrics.likes = this.parseNumberString(likeStr);
+                    if (metrics.likes > 0) break;
+                }
             }
 
             // Look for retweet counts
-            const retweetMatch = html.match(/(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*retweets?/i);
-            if (retweetMatch) {
-                metrics.retweets = this.parseNumberString(retweetMatch[1]);
+            const retweetPatterns = [
+                /"retweet_count":(\d+)/gi,
+                /(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*[Rr]etweets?/gi,
+                /retweets?['"]\s*:\s*[\s]*['"]?(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)/gi
+            ];
+
+            for (const pattern of retweetPatterns) {
+                const matches = [...html.matchAll(pattern)];
+                if (matches.length > 0) {
+                    const retweetStr = matches[0][1];
+                    metrics.retweets = this.parseNumberString(retweetStr);
+                    if (metrics.retweets > 0) break;
+                }
             }
 
         } catch (error) {
-            logger.debug('Error parsing embed metrics:', error.message);
+            logger.debug('Error parsing HTML metrics:', error.message);
         }
 
         return metrics.views > 0 || metrics.likes > 0 || metrics.retweets > 0 ? metrics : null;
     }
 
-    async getMetricsFromAPI(tweetId) {
-        try {
-            const url = `https://api.twitter.com/2/tweets/${tweetId}`;
-            const params = {
-                'tweet.fields': 'public_metrics,created_at,author_id',
-                'expansions': 'author_id'
-            };
-
-            const response = await retryWithBackoff(
-                () => this.httpClient.get(url, {
-                    params,
-                    headers: {
-                        'Authorization': `Bearer ${this.config.bearerToken}`
-                    }
-                }),
-                this.config.maxRetries
-            );
-
-            this.handleRateLimit(response.headers);
-
-            if (response.data && response.data.data) {
-                const tweet = response.data.data;
-                const metrics = tweet.public_metrics;
-
-                return {
-                    views: metrics.impression_count || 0,
-                    likes: metrics.like_count || 0,
-                    retweets: metrics.retweet_count || 0,
-                    replies: metrics.reply_count || 0,
-                    quotes: metrics.quote_count || 0
-                };
-            }
-
-            return null;
-        } catch (error) {
-            if (error.response?.status === 429) {
-                this.handleRateLimitError(error.response.headers);
-            }
-            logger.debug(`API method failed for tweet ${tweetId}:`, error.message);
-            return null;
-        }
-    }
-
-    async getMetricsFromScraping(tweetId) {
-        try {
-            // This is a basic scraping approach - be careful with rate limits
-            const url = `https://twitter.com/x/status/${tweetId}`;
-            
-            const response = await retryWithBackoff(
-                () => this.httpClient.get(url, {
-                    headers: {
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.5',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'DNT': '1',
-                        'Connection': 'keep-alive',
-                        'Upgrade-Insecure-Requests': '1',
-                    }
-                }),
-                this.config.maxRetries
-            );
-
-            if (response.data) {
-                return this.parseScrapedMetrics(response.data);
-            }
-
-            return null;
-        } catch (error) {
-            logger.debug(`Scraping method failed for tweet ${tweetId}:`, error.message);
-            return null;
-        }
-    }
-
-    parseScrapedMetrics(html) {
+    parseEmbedMetrics(html) {
+        // Simplified embed parsing
         const metrics = {
             views: 0,
             likes: 0,
@@ -241,13 +251,12 @@ class TwitterValidator {
             replies: 0
         };
 
+        // Embed HTML is usually simpler, look for basic patterns
         try {
-            // These patterns may need adjustment based on Twitter's current HTML structure
             const patterns = {
-                views: /(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*Views/i,
-                likes: /aria-label="(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*Likes"/i,
-                retweets: /aria-label="(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*Retweets"/i,
-                replies: /aria-label="(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*replies"/i
+                likes: /(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*likes?/i,
+                retweets: /(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*retweets?/i,
+                views: /(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)\s*views?/i
             };
 
             for (const [key, pattern] of Object.entries(patterns)) {
@@ -256,9 +265,8 @@ class TwitterValidator {
                     metrics[key] = this.parseNumberString(match[1]);
                 }
             }
-
         } catch (error) {
-            logger.debug('Error parsing scraped metrics:', error.message);
+            logger.debug('Error parsing embed metrics:', error.message);
         }
 
         return metrics.views > 0 || metrics.likes > 0 || metrics.retweets > 0 ? metrics : null;
@@ -281,33 +289,16 @@ class TwitterValidator {
         return parseInt(cleanStr) || 0;
     }
 
-    handleRateLimit(headers) {
-        const remaining = headers['x-rate-limit-remaining'];
-        const reset = headers['x-rate-limit-reset'];
-        
-        if (remaining !== undefined) {
-            logger.debug(`API calls remaining: ${remaining}`);
-            
-            if (parseInt(remaining) < 10) {
-                const resetTime = new Date(parseInt(reset) * 1000);
-                logger.warn(`Approaching rate limit. Reset at: ${resetTime}`);
-            }
-        }
-    }
-
-    handleRateLimitError(headers) {
-        const reset = headers['x-rate-limit-reset'];
-        if (reset) {
-            this.rateLimitedUntil = parseInt(reset) * 1000;
-            logger.warn(`Rate limited until: ${new Date(this.rateLimitedUntil)}`);
-        } else {
-            this.rateLimitedUntil = Date.now() + this.config.rateLimitDelay;
-            logger.warn(`Rate limited for ${this.config.rateLimitDelay}ms`);
-        }
-    }
-
     isRateLimited() {
         return Date.now() < this.rateLimitedUntil;
+    }
+
+    // Simple rate limiting
+    handleRateLimit(error) {
+        if (error.response?.status === 429 || error.message.includes('rate limit')) {
+            this.rateLimitedUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
+            logger.warn('Rate limited for 5 minutes');
+        }
     }
 
     getStatus() {
@@ -315,31 +306,8 @@ class TwitterValidator {
             rateLimitedUntil: this.rateLimitedUntil,
             isRateLimited: this.isRateLimited(),
             requestCount: this.requestCount,
-            hasApiKey: !!this.config.bearerToken,
-            useEmbedMethod: this.config.useEmbedMethod
+            method: 'web-scraping'
         };
-    }
-
-    // Test method to validate configuration
-    async testConfiguration() {
-        const testTweetId = '1234567890123456789'; // Use a known tweet ID for testing
-        
-        try {
-            const result = await this.validateEngagement(`https://twitter.com/x/status/${testTweetId}`);
-            return {
-                success: !!result,
-                methods: {
-                    embed: this.config.useEmbedMethod,
-                    api: !!this.config.bearerToken,
-                    scraping: true
-                }
-            };
-        } catch (error) {
-            return {
-                success: false,
-                error: error.message
-            };
-        }
     }
 }
 

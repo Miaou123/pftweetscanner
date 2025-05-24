@@ -1,31 +1,18 @@
 // src/orchestrators/analysisOrchestrator.js
 const logger = require('../utils/logger');
-const UnifiedBundleAnalyzer = require('../analysis/bundle');
-const { analyzeBestTraders } = require('../analysis/bestTraders');
-const { analyzeTeamSupply } = require('../analysis/teamSupply');
-const { analyzeFreshWallets } = require('../analysis/freshWallets');
-const { scanToken } = require('../analysis/topHoldersScanner');
-const DevAnalyzer = require('../analysis/devAnalyzer');
+const BundleAnalyzer = require('../analysis/bundleAnalyzer');
 const TelegramPublisher = require('../publishers/telegramPublisher');
 
 class AnalysisOrchestrator {
     constructor(config = {}) {
         this.config = {
             analysisTimeout: config.analysisTimeout || 5 * 60 * 1000, // 5 minutes
-            enabledAnalyses: config.enabledAnalyses || [
-                'bundle',
-                'topHolders', 
-                'devAnalysis',
-                'teamSupply',
-                'freshWallets'
-            ],
+            enabledAnalyses: ['bundle'], // Only bundle analysis
             publishResults: config.publishResults !== false,
-            minHoldersForAnalysis: config.minHoldersForAnalysis || 20,
             ...config
         };
 
-        this.bundleAnalyzer = new UnifiedBundleAnalyzer();
-        this.devAnalyzer = DevAnalyzer;
+        this.bundleAnalyzer = BundleAnalyzer;
         this.telegramPublisher = new TelegramPublisher(config.telegram || {});
         
         // Analysis state
@@ -36,7 +23,7 @@ class AnalysisOrchestrator {
     async analyzeToken(tokenData) {
         const { tokenAddress, tokenInfo, twitterMetrics, operationId } = tokenData;
         
-        logger.info(`🔬 [${operationId}] Starting comprehensive analysis for ${tokenInfo.symbol} (${tokenAddress})`);
+        logger.info(`🔬 [${operationId}] Starting bundle analysis for ${tokenInfo.symbol} (${tokenAddress})`);
         
         const analysisResult = {
             tokenAddress,
@@ -55,36 +42,38 @@ class AnalysisOrchestrator {
         this.activeAnalyses.set(operationId, cancellationToken);
 
         try {
-            // Run analyses in parallel with timeout
-            const analysisPromises = this.createAnalysisPromises(
-                tokenAddress, 
-                tokenInfo, 
-                operationId, 
+            // Run bundle analysis only
+            const bundleAnalysis = await this.runAnalysisWithTimeout(
+                'bundle',
+                () => this.bundleAnalyzer.analyzeBundle(tokenAddress, 50000),
+                operationId,
                 cancellationToken
             );
 
-            const results = await Promise.allSettled(analysisPromises);
-            
             // Process results
-            this.processAnalysisResults(results, analysisResult);
+            analysisResult.analyses.bundle = bundleAnalysis;
+            
+            if (!bundleAnalysis.success) {
+                analysisResult.errors.push(`bundle: ${bundleAnalysis.error}`);
+            }
             
             // Generate summary
             this.generateAnalysisSummary(analysisResult);
             
             // Determine if analysis was successful
-            analysisResult.success = this.hasMinimumSuccessfulAnalyses(analysisResult);
+            analysisResult.success = bundleAnalysis.success;
             analysisResult.endTime = Date.now();
             analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
 
             if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Analysis completed successfully in ${analysisResult.duration}ms`);
+                logger.info(`✅ [${operationId}] Bundle analysis completed successfully in ${analysisResult.duration}ms`);
                 
                 // Publish results if enabled
                 if (this.config.publishResults) {
                     await this.publishResults(analysisResult);
                 }
             } else {
-                logger.warn(`⚠️ [${operationId}] Analysis completed with limited success`);
+                logger.warn(`⚠️ [${operationId}] Bundle analysis failed`);
             }
 
             return analysisResult;
@@ -103,72 +92,6 @@ class AnalysisOrchestrator {
             // Clean up old completed analyses
             this.cleanupCompletedAnalyses();
         }
-    }
-
-    createAnalysisPromises(tokenAddress, tokenInfo, operationId, cancellationToken) {
-        const promises = [];
-
-        // Bundle Analysis
-        if (this.config.enabledAnalyses.includes('bundle')) {
-            promises.push(
-                this.runAnalysisWithTimeout(
-                    'bundle',
-                    () => this.bundleAnalyzer.analyzeBundle(tokenAddress, 50000, false),
-                    operationId,
-                    cancellationToken
-                )
-            );
-        }
-
-        // Top Holders Analysis
-        if (this.config.enabledAnalyses.includes('topHolders')) {
-            promises.push(
-                this.runAnalysisWithTimeout(
-                    'topHolders',
-                    () => scanToken(tokenAddress, this.config.minHoldersForAnalysis, false, operationId),
-                    operationId,
-                    cancellationToken
-                )
-            );
-        }
-
-        // Dev Analysis
-        if (this.config.enabledAnalyses.includes('devAnalysis')) {
-            promises.push(
-                this.runAnalysisWithTimeout(
-                    'devAnalysis',
-                    () => this.devAnalyzer.analyzeDevProfile(tokenAddress),
-                    operationId,
-                    cancellationToken
-                )
-            );
-        }
-
-        // Team Supply Analysis
-        if (this.config.enabledAnalyses.includes('teamSupply')) {
-            promises.push(
-                this.runAnalysisWithTimeout(
-                    'teamSupply',
-                    () => analyzeTeamSupply(tokenAddress, operationId, cancellationToken),
-                    operationId,
-                    cancellationToken
-                )
-            );
-        }
-
-        // Fresh Wallets Analysis
-        if (this.config.enabledAnalyses.includes('freshWallets')) {
-            promises.push(
-                this.runAnalysisWithTimeout(
-                    'freshWallets',
-                    () => analyzeFreshWallets(tokenAddress, operationId),
-                    operationId,
-                    cancellationToken
-                )
-            );
-        }
-
-        return promises;
     }
 
     async runAnalysisWithTimeout(analysisType, analysisFunction, operationId, cancellationToken) {
@@ -220,124 +143,36 @@ class AnalysisOrchestrator {
         }
     }
 
-    processAnalysisResults(results, analysisResult) {
-        results.forEach((promiseResult, index) => {
-            if (promiseResult.status === 'fulfilled') {
-                const analysis = promiseResult.value;
-                analysisResult.analyses[analysis.type] = analysis;
-                
-                if (!analysis.success) {
-                    analysisResult.errors.push(`${analysis.type}: ${analysis.error}`);
-                }
-            } else {
-                analysisResult.errors.push(`Analysis ${index} rejected: ${promiseResult.reason.message}`);
-            }
-        });
-    }
-
     generateAnalysisSummary(analysisResult) {
+        const bundleAnalysis = analysisResult.analyses.bundle;
+        
         const summary = {
-            totalAnalyses: Object.keys(analysisResult.analyses).length,
-            successfulAnalyses: 0,
-            failedAnalyses: 0,
+            totalAnalyses: 1,
+            successfulAnalyses: bundleAnalysis.success ? 1 : 0,
+            failedAnalyses: bundleAnalysis.success ? 0 : 1,
             flags: [],
             scores: {}
         };
 
-        // Count successes and failures
-        Object.values(analysisResult.analyses).forEach(analysis => {
-            if (analysis.success) {
-                summary.successfulAnalyses++;
-                this.addAnalysisFlags(analysis, summary.flags);
-                this.calculateAnalysisScore(analysis, summary.scores);
-            } else {
-                summary.failedAnalyses++;
+        // Add bundle-specific flags and scores
+        if (bundleAnalysis.success && bundleAnalysis.result) {
+            const result = bundleAnalysis.result;
+            
+            // Add flags
+            if (result.bundleDetected) {
+                summary.flags.push(`🔴 Bundle detected: ${result.percentageBundled?.toFixed(2)}% of supply`);
             }
-        });
-
-        // Calculate overall risk score
-        summary.overallScore = this.calculateOverallScore(summary.scores);
-        summary.riskLevel = this.determineRiskLevel(summary.overallScore);
+            
+            // Calculate score
+            summary.scores.bundle = result.bundleDetected ? 0 : 100;
+            summary.overallScore = summary.scores.bundle;
+            summary.riskLevel = this.determineRiskLevel(summary.overallScore);
+        } else {
+            summary.overallScore = 0;
+            summary.riskLevel = 'UNKNOWN';
+        }
 
         analysisResult.summary = summary;
-    }
-
-    addAnalysisFlags(analysis, flags) {
-        const { type, result } = analysis;
-
-        switch (type) {
-            case 'bundle':
-                if (result?.bundleDetected) {
-                    flags.push(`🔴 Bundle detected: ${result.percentageBundled?.toFixed(2)}% of supply`);
-                }
-                break;
-
-            case 'teamSupply':
-                if (result?.scanData?.totalSupplyControlled > 30) {
-                    flags.push(`⚠️ Team controls ${result.scanData.totalSupplyControlled.toFixed(2)}% of supply`);
-                }
-                break;
-
-            case 'freshWallets':
-                if (result?.scanData?.totalSupplyControlled > 20) {
-                    flags.push(`🆕 Fresh wallets hold ${result.scanData.totalSupplyControlled.toFixed(2)}% of supply`);
-                }
-                break;
-
-            case 'topHolders':
-                if (result?.totalSupplyControlled > 50) {
-                    flags.push(`📊 Top holders control ${result.totalSupplyControlled.toFixed(2)}% of supply`);
-                }
-                break;
-
-            case 'devAnalysis':
-                if (result?.success && result.coinsStats?.bondedPercentage) {
-                    const bondedPercent = parseFloat(result.coinsStats.bondedPercentage);
-                    if (bondedPercent > 50) {
-                        flags.push(`👨‍💻 Dev has ${bondedPercent}% success rate (${result.coinsStats.bondedCount}/${result.coinsStats.totalCoins})`);
-                    }
-                }
-                break;
-        }
-    }
-
-    calculateAnalysisScore(analysis, scores) {
-        const { type, result } = analysis;
-
-        switch (type) {
-            case 'bundle':
-                scores.bundle = result?.bundleDetected ? 0 : 100;
-                break;
-
-            case 'teamSupply':
-                const teamControl = result?.scanData?.totalSupplyControlled || 0;
-                scores.teamSupply = Math.max(0, 100 - (teamControl * 2)); // 50% team = 0 score
-                break;
-
-            case 'freshWallets':
-                const freshControl = result?.scanData?.totalSupplyControlled || 0;
-                scores.freshWallets = Math.max(0, 100 - (freshControl * 3)); // 33% fresh = 0 score
-                break;
-
-            case 'topHolders':
-                const holderControl = result?.totalSupplyControlled || 0;
-                scores.topHolders = Math.max(0, 100 - (holderControl * 1.5)); // 66% holders = 0 score
-                break;
-
-            case 'devAnalysis':
-                if (result?.success && result.coinsStats?.bondedPercentage) {
-                    const bondedPercent = parseFloat(result.coinsStats.bondedPercentage);
-                    scores.devAnalysis = Math.min(100, bondedPercent * 2); // 50% success = 100 score
-                }
-                break;
-        }
-    }
-
-    calculateOverallScore(scores) {
-        const values = Object.values(scores).filter(score => typeof score === 'number');
-        if (values.length === 0) return 0;
-        
-        return values.reduce((sum, score) => sum + score, 0) / values.length;
     }
 
     determineRiskLevel(score) {
@@ -347,16 +182,9 @@ class AnalysisOrchestrator {
         return 'VERY_HIGH';
     }
 
-    hasMinimumSuccessfulAnalyses(analysisResult) {
-        const successfulCount = Object.values(analysisResult.analyses)
-            .filter(analysis => analysis.success).length;
-        
-        return successfulCount >= 2; // At least 2 successful analyses
-    }
-
     async publishResults(analysisResult) {
         try {
-            logger.info(`📤 [${analysisResult.operationId}] Publishing analysis results`);
+            logger.info(`📤 [${analysisResult.operationId}] Publishing bundle analysis results`);
             await this.telegramPublisher.publishAnalysis(analysisResult);
         } catch (error) {
             logger.error(`Failed to publish results for ${analysisResult.operationId}:`, error);
@@ -416,8 +244,7 @@ class AnalysisOrchestrator {
             enabledAnalyses: this.config.enabledAnalyses,
             config: {
                 analysisTimeout: this.config.analysisTimeout,
-                publishResults: this.config.publishResults,
-                minHoldersForAnalysis: this.config.minHoldersForAnalysis
+                publishResults: this.config.publishResults
             }
         };
     }

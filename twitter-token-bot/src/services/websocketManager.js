@@ -56,28 +56,61 @@ class WebSocketManager extends EventEmitter {
     }
 
     handleMessage(data) {
+        console.log('🔍 RAW WEBSOCKET MESSAGE:', data.toString().substring(0, 200) + '...'); // Debug line
         try {
             const message = JSON.parse(data.toString());
             
-            // Log different message types appropriately
-            if (message.type === 'newTokenEvent') {
-                logger.info(`[${this.connectionId}] New token detected: ${message.mint} (${message.name})`);
-                this.emit('newToken', message);
-            } else if (message.type === 'tradeEvent') {
+            // Handle subscription confirmation
+            if (message.message && message.message.includes('Successfully subscribed')) {
+                logger.info(`[${this.connectionId}] ✅ ${message.message}`);
+                return;
+            }
+            
+            // Check if this is a token creation event
+            if (message.txType === 'create' && message.mint && message.name && message.symbol) {
+                logger.info(`[${this.connectionId}] 🪙 NEW TOKEN: ${message.name} (${message.symbol}) - ${message.mint}`);
+                logger.debug(`[${this.connectionId}] Token details:`, {
+                    mint: message.mint,
+                    name: message.name,
+                    symbol: message.symbol,
+                    uri: message.uri,
+                    creator: message.traderPublicKey,
+                    marketCapSol: message.marketCapSol,
+                    initialBuy: message.initialBuy
+                });
+                
+                // Transform the message to match expected format
+                const tokenEvent = {
+                    mint: message.mint,
+                    name: message.name,
+                    symbol: message.symbol,
+                    uri: message.uri,
+                    traderPublicKey: message.traderPublicKey,
+                    creator: message.traderPublicKey,
+                    signature: message.signature,
+                    marketCapSol: message.marketCapSol,
+                    initialBuy: message.initialBuy,
+                    solAmount: message.solAmount,
+                    timestamp: Date.now(),
+                    // Additional metadata
+                    bondingCurveKey: message.bondingCurveKey,
+                    vTokensInBondingCurve: message.vTokensInBondingCurve,
+                    vSolInBondingCurve: message.vSolInBondingCurve,
+                    pool: message.pool
+                };
+                
+                this.emit('newToken', tokenEvent);
+            } else if (message.signature && !message.txType) {
+                // This might be a trade or other event
+                logger.debug(`[${this.connectionId}] 💱 Possible trade event: ${message.signature.substring(0, 8)}...`);
                 this.emit('tokenTrade', message);
-            } else if (message.type === 'migrationEvent') {
-                logger.info(`[${this.connectionId}] Migration detected: ${message.mint}`);
-                this.emit('migration', message);
-            } else if (message.type === 'pong') {
-                // Pong response - connection is healthy
-                logger.debug(`[${this.connectionId}] Received pong`);
             } else {
-                logger.debug(`[${this.connectionId}] Received message:`, message);
-                this.emit('message', message);
+                // Log any other message types we might be missing
+                logger.debug(`[${this.connectionId}] ❓ Unknown message:`, Object.keys(message));
             }
         } catch (error) {
             logger.error(`[${this.connectionId}] Error parsing WebSocket message:`, error);
-            logger.debug('Raw message data:', data.toString());
+            logger.debug('Raw message data:', data.toString().substring(0, 500) + '...');
         }
     }
 
@@ -126,7 +159,7 @@ class WebSocketManager extends EventEmitter {
     startPing() {
         this.pingTimer = setInterval(() => {
             if (this.isConnected && this.ws.readyState === WebSocket.OPEN) {
-                this.send({ method: 'ping' });
+                this.ws.ping(); // Use WebSocket's built-in ping
             }
         }, this.pingInterval);
     }

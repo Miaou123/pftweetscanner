@@ -1,5 +1,6 @@
-// src/analysis/topHoldersAnalyzer.js
+// src/analysis/topHoldersAnalyzer.js - Complete rewrite using your getHolders
 const { getSolanaApi } = require('../integrations/solanaApi');
+const { getTopHolders } = require('../tools/getHolders'); // Your proven implementation
 const { isFreshWallet } = require('../tools/freshWalletChecker');
 const logger = require('../utils/logger');
 const BigNumber = require('bignumber.js');
@@ -9,6 +10,7 @@ class TopHoldersAnalyzer {
         this.solanaApi = getSolanaApi();
         this.HIGH_VALUE_THRESHOLD = 100000; // $100k USD threshold for whales
         this.FRESH_WALLET_TX_THRESHOLD = 50; // Less than 50 transactions = fresh wallet
+        this.SOL_PRICE_ESTIMATE = 200; // Rough SOL price for USD calculations
     }
 
     async analyzeTopHolders(tokenAddress, count = 20) {
@@ -22,10 +24,16 @@ class TopHoldersAnalyzer {
             }
 
             const tokenInfo = this.formatTokenInfo(tokenMetadata, tokenAddress);
-            logger.debug('Token info:', tokenInfo);
+            logger.debug('Token info retrieved:', { 
+                symbol: tokenInfo.symbol, 
+                decimals: tokenInfo.decimals, 
+                supply: tokenInfo.total_supply 
+            });
 
-            // Get top holders
-            const topHolders = await this.getTopHolders(tokenAddress, count);
+            // Use your proven getTopHolders function
+            logger.debug('Fetching top holders using proven implementation...');
+            const topHolders = await getTopHolders(tokenAddress, count, 'topHoldersAnalysis', 'fetchTopHolders');
+            
             if (!topHolders || topHolders.length === 0) {
                 logger.warn(`No holders found for token ${tokenAddress}`);
                 return {
@@ -35,18 +43,20 @@ class TopHoldersAnalyzer {
                 };
             }
 
-            logger.info(`Found ${topHolders.length} top holders for analysis`);
+            logger.info(`Successfully fetched ${topHolders.length} top holders for analysis`);
 
-            // Analyze each holder
-            const analysisResults = await this.analyzeHolders(topHolders, tokenAddress, tokenInfo);
+            // Analyze each holder with your proven data format
+            const analysisResults = await this.analyzeHoldersWithYourData(topHolders, tokenAddress, tokenInfo);
 
-            // Generate summary
-            const summary = this.generateSummary(analysisResults, tokenInfo);
+            // Generate comprehensive summary
+            const summary = this.generateComprehensiveSummary(analysisResults, tokenInfo);
 
             logger.info(`Top holders analysis completed for ${tokenAddress}:`, {
                 totalHolders: analysisResults.length,
                 whales: summary.whaleCount,
-                freshWallets: summary.freshWalletCount
+                freshWallets: summary.freshWalletCount,
+                riskLevel: summary.riskLevel,
+                riskScore: summary.riskScore
             });
 
             return {
@@ -62,156 +72,107 @@ class TopHoldersAnalyzer {
             return {
                 success: false,
                 error: error.message,
-                tokenInfo: null
+                tokenInfo: this.getBasicTokenInfo(tokenAddress)
             };
         }
     }
 
-    async getTopHolders(tokenAddress, count) {
-        try {
-            // This is a simplified version - you might need to adapt based on your data source
-            // For now, we'll use a placeholder that you can replace with your actual holder fetching logic
-            logger.debug(`Fetching top ${count} holders for ${tokenAddress}`);
-            
-            // You'll need to implement this based on your data source (Helius, etc.)
-            // This is just a placeholder structure
-            const holders = await this.fetchHoldersFromHelius(tokenAddress, count);
-            
-            return holders;
+    async analyzeHoldersWithYourData(holders, tokenAddress, tokenInfo) {
+        logger.debug(`Analyzing ${holders.length} holders individually...`);
+        const results = [];
+        const batchSize = 5; // Process in small batches to avoid rate limits
 
-        } catch (error) {
-            logger.error(`Error fetching top holders for ${tokenAddress}:`, error);
-            return [];
-        }
-    }
-
-    async fetchHoldersFromHelius(tokenAddress, count) {
-        try {
-            // Using Helius API to get token accounts
-            const response = await this.solanaApi.callHelius('getTokenAccounts', {
-                mint: tokenAddress,
-                limit: count,
-                sortBy: 'amount',
-                sortDirection: 'desc'
+        for (let i = 0; i < holders.length; i += batchSize) {
+            const batch = holders.slice(i, i + batchSize);
+            
+            const batchPromises = batch.map(async (holder, batchIndex) => {
+                const holderIndex = i + batchIndex + 1;
+                try {
+                    logger.debug(`Analyzing holder ${holderIndex}/${holders.length}: ${holder.address}`);
+                    return await this.analyzeIndividualHolderWithYourData(holder, tokenAddress, tokenInfo);
+                } catch (error) {
+                    logger.warn(`Error analyzing holder ${holder.address}:`, error.message);
+                    return this.createErrorHolderResult(holder, error.message);
+                }
             });
 
-            if (!response || !response.token_accounts) {
-                logger.warn(`No token accounts found for ${tokenAddress}`);
-                return [];
-            }
-
-            const holders = response.token_accounts.map(account => ({
-                address: account.owner,
-                balance: account.amount,
-                tokenBalance: account.amount,
-                decimals: account.decimals || 6
-            }));
-
-            logger.debug(`Found ${holders.length} holders from Helius`);
-            return holders;
-
-        } catch (error) {
-            logger.error(`Error fetching holders from Helius:`, error);
-            return [];
-        }
-    }
-
-    async analyzeHolders(holders, tokenAddress, tokenInfo) {
-        const results = [];
-
-        for (let i = 0; i < holders.length; i++) {
-            const holder = holders[i];
-            try {
-                logger.debug(`Analyzing holder ${i + 1}/${holders.length}: ${holder.address}`);
-
-                const analysis = await this.analyzeIndividualHolder(holder, tokenAddress, tokenInfo);
-                results.push(analysis);
-
-                // Small delay to avoid rate limiting
-                if (i < holders.length - 1) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
+            const batchResults = await Promise.allSettled(batchPromises);
+            
+            batchResults.forEach((result) => {
+                if (result.status === 'fulfilled') {
+                    results.push(result.value);
+                } else {
+                    logger.warn('Batch analysis failed:', result.reason);
                 }
+            });
 
-            } catch (error) {
-                logger.warn(`Error analyzing holder ${holder.address}:`, error);
-                results.push({
-                    address: holder.address,
-                    error: error.message,
-                    isWhale: false,
-                    isFresh: false,
-                    balance: holder.balance || 0
-                });
+            // Small delay between batches
+            if (i + batchSize < holders.length) {
+                await new Promise(resolve => setTimeout(resolve, 200));
             }
         }
 
+        logger.debug(`Completed analysis of ${results.length} holders`);
         return results;
     }
 
-    async analyzeIndividualHolder(holder, tokenAddress, tokenInfo) {
+    async analyzeIndividualHolderWithYourData(holder, tokenAddress, tokenInfo) {
         const address = holder.address;
-        const balance = new BigNumber(holder.balance || 0);
-        const adjustedBalance = balance.dividedBy(new BigNumber(10).pow(tokenInfo.decimals || 6));
-
-        // Calculate holding percentage
+        
+        // Your getHolders already provides excellent balance data
+        const tokenBalance = new BigNumber(holder.tokenBalance || holder.balance || 0);
+        const solBalance = parseFloat(holder.solBalance || 0);
+        
+        // Calculate holding percentage using your data
         const totalSupply = new BigNumber(tokenInfo.total_supply || 1000000000);
-        const holdingPercentage = adjustedBalance.dividedBy(totalSupply).multipliedBy(100);
+        const holdingPercentage = tokenBalance.dividedBy(totalSupply).multipliedBy(100);
 
-        // Get wallet value and transaction history (for whale and fresh detection only)
-        const [accountInfo, signatures] = await Promise.all([
-            this.getWalletValue(address),
-            this.getWalletSignatures(address)
-        ]);
+        // Estimate USD values
+        const solValueUsd = solBalance * this.SOL_PRICE_ESTIMATE;
+        const tokenValueUsd = this.estimateTokenValue(tokenBalance, tokenInfo);
 
-        // Determine wallet type (only whale and fresh - no inactive check)
-        const isWhale = await this.isWhaleWallet(address, accountInfo);
-        const isFresh = await this.isFreshWallet(address, signatures);
+        // Check if wallet is fresh (low transaction count)
+        let isFresh = false;
+        let transactionCount = 0;
+        
+        try {
+            // Use your fresh wallet checker if available, otherwise get signatures
+            if (typeof isFreshWallet === 'function') {
+                isFresh = await isFreshWallet(address, null, 'topHoldersAnalysis', 'freshCheck');
+            } else {
+                const signatures = await this.getWalletSignatures(address);
+                transactionCount = signatures.length;
+                isFresh = transactionCount <= this.FRESH_WALLET_TX_THRESHOLD;
+            }
+        } catch (error) {
+            logger.debug(`Could not determine fresh status for ${address}: ${error.message}`);
+            // Default to not fresh if we can't determine
+            isFresh = false;
+        }
+
+        // Determine if wallet is a whale based on SOL holdings
+        const isWhale = solValueUsd >= this.HIGH_VALUE_THRESHOLD;
+
+        // Categorize the wallet
+        const category = this.categorizeWallet(isWhale, isFresh, solValueUsd);
 
         return {
             address,
-            balance: adjustedBalance.toString(),
+            balance: tokenBalance.toString(),
             holdingPercentage: holdingPercentage.toFixed(4),
-            walletValue: accountInfo?.totalValue || 0,
-            transactionCount: signatures?.length || 0,
+            solBalance: solBalance.toFixed(4),
+            solValueUsd: solValueUsd,
+            tokenValueUsd: tokenValueUsd,
+            transactionCount: transactionCount,
             isWhale,
             isFresh,
-            category: this.categorizeWallet(isWhale, isFresh),
+            category,
             analysis: {
-                solBalance: accountInfo?.solBalance || 0,
-                tokenCount: accountInfo?.tokenCount || 0,
-                lastActivity: signatures?.[0]?.blockTime || null
+                estimatedTotalValue: solValueUsd + tokenValueUsd,
+                riskFlags: this.generateHolderRiskFlags(isWhale, isFresh, holdingPercentage.toNumber()),
+                confidence: this.calculateAnalysisConfidence(solBalance, transactionCount)
             }
         };
-    }
-
-    async getWalletValue(address) {
-        try {
-            // Get SOL balance
-            const accountInfo = await this.solanaApi.getAccountInfo(address);
-            const solBalance = accountInfo?.value?.lamports ? 
-                accountInfo.value.lamports / 1e9 : 0;
-
-            // Get token accounts (simplified)
-            const tokenAccounts = await this.solanaApi.callHelius('getTokenAccounts', {
-                owner: address,
-                limit: 100
-            });
-
-            const tokenCount = tokenAccounts?.token_accounts?.length || 0;
-            
-            // Estimate total value (SOL + tokens)
-            // For a more accurate calculation, you'd need to get token prices
-            const estimatedTotalValue = solBalance * 200; // Rough SOL price estimate
-
-            return {
-                totalValue: estimatedTotalValue,
-                solBalance,
-                tokenCount
-            };
-
-        } catch (error) {
-            logger.debug(`Error getting wallet value for ${address}:`, error);
-            return { totalValue: 0, solBalance: 0, tokenCount: 0 };
-        }
     }
 
     async getWalletSignatures(address) {
@@ -222,113 +183,212 @@ class TopHoldersAnalyzer {
             );
             return signatures || [];
         } catch (error) {
-            logger.debug(`Error getting signatures for ${address}:`, error);
+            logger.debug(`Error getting signatures for ${address}:`, error.message);
             return [];
         }
     }
 
-    async isWhaleWallet(address, accountInfo) {
-        const walletValue = accountInfo?.totalValue || 0;
-        return walletValue >= this.HIGH_VALUE_THRESHOLD;
-    }
-
-    async isFreshWallet(address, signatures) {
-        const txCount = signatures?.length || 0;
-        return txCount <= this.FRESH_WALLET_TX_THRESHOLD;
-    }
-
-    categorizeWallet(isWhale, isFresh) {
+    categorizeWallet(isWhale, isFresh, usdValue) {
         if (isWhale) return 'Whale';
         if (isFresh) return 'Fresh';
+        if (usdValue > 10000) return 'High Value'; // $10k+ but not whale level
         return 'Regular';
     }
 
-    generateSummary(analysisResults, tokenInfo) {
+    generateHolderRiskFlags(isWhale, isFresh, holdingPercentage) {
+        const flags = [];
+        
+        if (isFresh && holdingPercentage > 1) {
+            flags.push('Fresh wallet with significant holdings');
+        }
+        
+        if (holdingPercentage > 5) {
+            flags.push('Large supply concentration');
+        }
+        
+        if (isWhale && holdingPercentage > 2) {
+            flags.push('Whale with concentrated position');
+        }
+        
+        return flags;
+    }
+
+    calculateAnalysisConfidence(solBalance, transactionCount) {
+        let confidence = 100;
+        
+        // Lower confidence if we couldn't get transaction data
+        if (transactionCount === 0) confidence -= 20;
+        
+        // Lower confidence for very low SOL balance (might be inactive)
+        if (solBalance < 0.001) confidence -= 15;
+        
+        return Math.max(confidence, 50); // Minimum 50% confidence
+    }
+
+    estimateTokenValue(tokenBalance, tokenInfo) {
+        // Simple estimation - in reality you'd want real price data
+        const price = tokenInfo.price || 0;
+        return tokenBalance.multipliedBy(price).toNumber();
+    }
+
+    generateComprehensiveSummary(analysisResults, tokenInfo) {
         const totalHolders = analysisResults.length;
         const whaleCount = analysisResults.filter(h => h.isWhale).length;
         const freshWalletCount = analysisResults.filter(h => h.isFresh).length;
-        const regularWalletCount = totalHolders - whaleCount - freshWalletCount;
+        const highValueCount = analysisResults.filter(h => h.category === 'High Value').length;
+        const regularWalletCount = totalHolders - whaleCount - freshWalletCount - highValueCount;
 
-        // Calculate concentration metrics
-        const top5Holdings = analysisResults.slice(0, 5)
-            .reduce((sum, holder) => sum + parseFloat(holder.holdingPercentage || 0), 0);
+        // Calculate concentration metrics using your proven data
+        const holdingPercentages = analysisResults.map(h => parseFloat(h.holdingPercentage || 0));
+        const top5Holdings = holdingPercentages.slice(0, 5).reduce((sum, pct) => sum + pct, 0);
+        const top10Holdings = holdingPercentages.slice(0, 10).reduce((sum, pct) => sum + pct, 0);
+        const top20Holdings = holdingPercentages.reduce((sum, pct) => sum + pct, 0);
+
+        // Advanced risk assessment
+        const riskScore = this.calculateAdvancedRiskScore(
+            whaleCount, 
+            freshWalletCount, 
+            top5Holdings, 
+            top10Holdings,
+            analysisResults
+        );
         
-        const top10Holdings = analysisResults.slice(0, 10)
-            .reduce((sum, holder) => sum + parseFloat(holder.holdingPercentage || 0), 0);
-
-        // Risk assessment (faster without inactive checks)
-        const riskScore = this.calculateRiskScore(whaleCount, freshWalletCount, top5Holdings);
         const riskLevel = this.determineRiskLevel(riskScore);
+        const riskFlags = this.generateSummaryRiskFlags(
+            whaleCount, 
+            freshWalletCount, 
+            top5Holdings, 
+            top10Holdings
+        );
 
         return {
             totalHolders,
             whaleCount,
             freshWalletCount,
+            highValueCount,
             regularWalletCount,
             whalePercentage: ((whaleCount / totalHolders) * 100).toFixed(1),
             freshWalletPercentage: ((freshWalletCount / totalHolders) * 100).toFixed(1),
             concentration: {
                 top5Percentage: top5Holdings.toFixed(2),
-                top10Percentage: top10Holdings.toFixed(2)
+                top10Percentage: top10Holdings.toFixed(2),
+                top20Percentage: top20Holdings.toFixed(2)
             },
             riskScore,
             riskLevel,
-            flags: this.generateFlags(whaleCount, freshWalletCount, top5Holdings)
+            flags: riskFlags,
+            insights: this.generateInsights(analysisResults, top5Holdings)
         };
     }
 
-    calculateRiskScore(whaleCount, freshWalletCount, top5Holdings) {
+    calculateAdvancedRiskScore(whaleCount, freshWalletCount, top5Holdings, top10Holdings, holders) {
         let score = 100; // Start with perfect score
 
         // Penalize for too many fresh wallets
-        if (freshWalletCount > 10) score -= 30;
-        else if (freshWalletCount > 5) score -= 15;
+        if (freshWalletCount > 12) score -= 35;
+        else if (freshWalletCount > 8) score -= 20;
+        else if (freshWalletCount > 5) score -= 10;
 
         // Penalize for too many whales
-        if (whaleCount > 8) score -= 20;
-        else if (whaleCount > 5) score -= 10;
+        if (whaleCount > 10) score -= 25;
+        else if (whaleCount > 6) score -= 15;
+        else if (whaleCount > 3) score -= 5;
 
-        // Penalize for high concentration
-        if (top5Holdings > 80) score -= 40;
-        else if (top5Holdings > 60) score -= 25;
-        else if (top5Holdings > 40) score -= 10;
+        // Heavy penalty for extreme concentration
+        if (top5Holdings > 90) score -= 50;
+        else if (top5Holdings > 80) score -= 40;
+        else if (top5Holdings > 70) score -= 30;
+        else if (top5Holdings > 60) score -= 20;
+        else if (top5Holdings > 50) score -= 10;
 
-        return Math.max(0, score);
+        // Additional penalty for top 10 concentration
+        if (top10Holdings > 95) score -= 20;
+        else if (top10Holdings > 85) score -= 10;
+
+        // Bonus for good distribution
+        if (freshWalletCount <= 3 && whaleCount <= 3 && top5Holdings < 40) {
+            score += 10;
+        }
+
+        return Math.max(0, Math.min(100, score));
     }
 
     determineRiskLevel(score) {
-        if (score >= 80) return 'LOW';
-        if (score >= 60) return 'MEDIUM';
-        if (score >= 40) return 'HIGH';
+        if (score >= 85) return 'LOW';
+        if (score >= 70) return 'MEDIUM';
+        if (score >= 50) return 'HIGH';
         return 'VERY_HIGH';
     }
 
-    generateFlags(whaleCount, freshWalletCount, top5Holdings) {
+    generateSummaryRiskFlags(whaleCount, freshWalletCount, top5Holdings, top10Holdings) {
         const flags = [];
 
-        if (freshWalletCount > 10) {
-            flags.push(`🔴 High fresh wallet count: ${freshWalletCount}/20`);
+        if (freshWalletCount > 12) {
+            flags.push(`🔴 Very high fresh wallet count: ${freshWalletCount}/20`);
+        } else if (freshWalletCount > 8) {
+            flags.push(`🟠 High fresh wallet count: ${freshWalletCount}/20`);
         } else if (freshWalletCount > 5) {
             flags.push(`🟡 Moderate fresh wallet count: ${freshWalletCount}/20`);
         }
 
-        if (whaleCount > 8) {
-            flags.push(`🔴 High whale concentration: ${whaleCount}/20`);
-        } else if (whaleCount > 5) {
+        if (whaleCount > 10) {
+            flags.push(`🔴 Very high whale concentration: ${whaleCount}/20`);
+        } else if (whaleCount > 6) {
+            flags.push(`🟠 High whale concentration: ${whaleCount}/20`);
+        } else if (whaleCount > 3) {
             flags.push(`🟡 Moderate whale presence: ${whaleCount}/20`);
         }
 
-        if (top5Holdings > 80) {
+        if (top5Holdings > 90) {
+            flags.push(`🔴 Extreme concentration: Top 5 hold ${top5Holdings.toFixed(1)}%`);
+        } else if (top5Holdings > 80) {
             flags.push(`🔴 Very high concentration: Top 5 hold ${top5Holdings.toFixed(1)}%`);
+        } else if (top5Holdings > 70) {
+            flags.push(`🟠 High concentration: Top 5 hold ${top5Holdings.toFixed(1)}%`);
         } else if (top5Holdings > 60) {
-            flags.push(`🟡 High concentration: Top 5 hold ${top5Holdings.toFixed(1)}%`);
+            flags.push(`🟡 Moderate concentration: Top 5 hold ${top5Holdings.toFixed(1)}%`);
         }
 
         if (flags.length === 0) {
-            flags.push('✅ Healthy holder distribution');
+            flags.push('✅ Healthy holder distribution detected');
         }
 
         return flags;
+    }
+
+    generateInsights(holders, top5Holdings) {
+        const insights = [];
+        
+        const avgHolding = holders.reduce((sum, h) => sum + parseFloat(h.holdingPercentage), 0) / holders.length;
+        if (avgHolding > 2) {
+            insights.push('High average holding percentage suggests concentrated ownership');
+        }
+        
+        const whalesWithLargeHoldings = holders.filter(h => h.isWhale && parseFloat(h.holdingPercentage) > 3).length;
+        if (whalesWithLargeHoldings > 0) {
+            insights.push(`${whalesWithLargeHoldings} whale(s) hold significant portions of supply`);
+        }
+        
+        const freshWithLargeHoldings = holders.filter(h => h.isFresh && parseFloat(h.holdingPercentage) > 1).length;
+        if (freshWithLargeHoldings > 3) {
+            insights.push('Multiple fresh wallets with substantial holdings - potential coordination');
+        }
+        
+        return insights;
+    }
+
+    createErrorHolderResult(holder, errorMessage) {
+        return {
+            address: holder.address,
+            error: errorMessage,
+            isWhale: false,
+            isFresh: false,
+            balance: holder.balance || 0,
+            category: 'Error',
+            analysis: {
+                confidence: 0
+            }
+        };
     }
 
     formatTokenInfo(tokenMetadata, tokenAddress) {
@@ -342,7 +402,18 @@ class TopHoldersAnalyzer {
             market_cap: (tokenMetadata.price || 0) * (tokenMetadata.supply?.total || 1000000000)
         };
     }
+
+    getBasicTokenInfo(tokenAddress) {
+        return {
+            decimals: 6,
+            symbol: 'Unknown',
+            name: 'Unknown Token',
+            address: tokenAddress,
+            price: 0,
+            total_supply: 1000000000,
+            market_cap: 0
+        };
+    }
 }
 
-// Export the class, not an instance
 module.exports = TopHoldersAnalyzer;

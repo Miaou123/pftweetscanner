@@ -110,6 +110,63 @@ class SolanaApi {
         }
     }
 
+    async getTokenLargestAccounts(tokenAddress) {
+        try {
+            const result = await this.callHelius('getTokenLargestAccounts', [tokenAddress]);
+            
+            if (!result) {
+                logger.debug(`No largest accounts found for token ${tokenAddress}`);
+                return null;
+            }
+            
+            return result;
+        } catch (error) {
+            logger.error(`Error getting largest token accounts for ${tokenAddress}:`, error);
+            return null;
+        }
+    }
+    
+    async getBalance(address) {
+        try {
+            const result = await this.callHelius('getBalance', [address]);
+            
+            if (!result || result.value === undefined) {
+                logger.debug(`No balance found for address: ${address}`);
+                return { value: 0 };
+            }
+            
+            return result;
+        } catch (error) {
+            logger.error(`Error getting balance for ${address}:`, error);
+            return { value: 0 };
+        }
+    }
+    
+    async getTokenAccounts(tokenAddress, limit = 1000, cursor = null) {
+        try {
+            const params = {
+                mint: tokenAddress,
+                limit: limit
+            };
+            
+            if (cursor) {
+                params.cursor = cursor;
+            }
+            
+            const result = await this.callHelius('getTokenAccounts', params);
+            
+            if (!result) {
+                logger.debug(`No token accounts found for ${tokenAddress}`);
+                return { token_accounts: [], cursor: null };
+            }
+            
+            return result;
+        } catch (error) {
+            logger.error(`Error getting token accounts for ${tokenAddress}:`, error);
+            return { token_accounts: [], cursor: null };
+        }
+    }
+
     async getTokenSupply(tokenAddress) {
         try {
             const result = await this.callHelius('getTokenSupply', [tokenAddress]);

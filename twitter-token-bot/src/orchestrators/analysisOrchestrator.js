@@ -1,17 +1,29 @@
-// src/orchestrators/analysisOrchestrator.js - Updated with Top Holders Analysis
+// Update src/orchestrators/analysisOrchestrator.js - Fix the configuration reading
+
 const logger = require('../utils/logger');
 const BundleAnalyzer = require('../analysis/bundleAnalyzer');
 const TopHoldersAnalyzer = require('../analysis/topHoldersAnalyzer');
 const TelegramPublisher = require('../publishers/telegramPublisher');
+const analysisConfig = require('../config/analysisConfig'); // Import your analysis config
 
 class AnalysisOrchestrator {
     constructor(config = {}) {
+        // Determine bot type from config
+        this.botType = config.botType || 'creation'; // 'creation' or 'migration'
+        
         this.config = {
-            analysisTimeout: config.analysisTimeout || 5 * 60 * 1000, // 5 minutes
-            enabledAnalyses: config.enabledAnalyses || ['bundle', 'topHolders'], // Now includes both
+            analysisTimeout: config.analysisTimeout || 5 * 60 * 1000,
             publishResults: config.publishResults !== false,
             ...config
         };
+
+        // Get bot-specific enabled analyses from your analysis config
+        const botSpecificConfig = analysisConfig.getConfigForBot(this.botType);
+        this.config.enabledAnalyses = botSpecificConfig.enabledAnalyses;
+        this.config.maxConcurrentAnalyses = botSpecificConfig.maxConcurrent;
+
+        logger.info(`🔬 AnalysisOrchestrator initialized for ${this.botType} bot`);
+        logger.info(`📋 Enabled analyses: ${this.config.enabledAnalyses.join(', ')}`);
 
         this.bundleAnalyzer = BundleAnalyzer;
         this.topHoldersAnalyzer = new TopHoldersAnalyzer();
@@ -26,6 +38,7 @@ class AnalysisOrchestrator {
         const { tokenAddress, tokenInfo, twitterMetrics, operationId, timer } = tokenData;
         
         logger.info(`🔬 [${operationId}] Starting comprehensive analysis for ${tokenInfo.symbol} (${tokenAddress})`);
+        logger.info(`🔬 [${operationId}] Bot type: ${this.botType}, Enabled analyses: ${this.config.enabledAnalyses.join(', ')}`);
         
         const analysisResult = {
             tokenAddress,
@@ -47,7 +60,7 @@ class AnalysisOrchestrator {
         try {
             const analysisPromises = [];
 
-            // Run Bundle Analysis and Top Holders Analysis IN PARALLEL if both enabled
+            // Run analyses based on what's enabled for this bot type
             if (this.config.enabledAnalyses.includes('bundle')) {
                 logger.info(`🔬 [${operationId}] Starting bundle analysis (parallel)`);
                 analysisPromises.push(
@@ -58,6 +71,8 @@ class AnalysisOrchestrator {
                         cancellationToken
                     )
                 );
+            } else {
+                logger.debug(`🔬 [${operationId}] Bundle analysis disabled for ${this.botType} bot`);
             }
 
             if (this.config.enabledAnalyses.includes('topHolders')) {
@@ -70,15 +85,30 @@ class AnalysisOrchestrator {
                         cancellationToken
                     )
                 );
+            } else {
+                logger.debug(`🔬 [${operationId}] Top holders analysis disabled for ${this.botType} bot`);
+            }
+
+            // Add more analyses here as they get enabled
+            if (this.config.enabledAnalyses.includes('devAnalysis')) {
+                logger.debug(`🔬 [${operationId}] Dev analysis not yet implemented`);
+            }
+
+            if (analysisPromises.length === 0) {
+                logger.warn(`🔬 [${operationId}] No analyses enabled for ${this.botType} bot!`);
+                throw new Error(`No analyses enabled for ${this.botType} bot`);
             }
 
             // Wait for ALL analyses to complete in parallel
+            logger.info(`🔬 [${operationId}] Running ${analysisPromises.length} analyses in parallel...`);
             const analysisResults = await Promise.allSettled(analysisPromises);
             logger.info(`🔬 [${operationId}] All parallel analyses completed`);
 
             // Process results
             analysisResults.forEach((result, index) => {
-                const analysisType = this.config.enabledAnalyses[index];
+                const analysisType = this.config.enabledAnalyses.filter(type => 
+                    ['bundle', 'topHolders', 'devAnalysis'].includes(type)
+                )[index];
                 
                 if (result.status === 'fulfilled') {
                     analysisResult.analyses[analysisType] = result.value;
@@ -97,25 +127,25 @@ class AnalysisOrchestrator {
             
             // Generate comprehensive summary
             this.generateComprehensiveSummary(analysisResult);
-            
+
             // Determine overall success
             const successfulAnalyses = Object.values(analysisResult.analyses)
                 .filter(analysis => analysis.success).length;
-            
+
             analysisResult.success = successfulAnalyses > 0;
             analysisResult.endTime = Date.now();
             analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
 
+            // Always publish results - even if analysis failed
+            if (this.config.publishResults) {
+                await this.publishResults(analysisResult);
+            }
+
             if (analysisResult.success) {
                 logger.info(`✅ [${operationId}] Comprehensive analysis completed successfully in ${analysisResult.duration}ms`);
                 logger.info(`📊 [${operationId}] Results: ${successfulAnalyses}/${Object.keys(analysisResult.analyses).length} analyses successful`);
-                
-                // Publish results if enabled
-                if (this.config.publishResults) {
-                    await this.publishResults(analysisResult);
-                }
             } else {
-                logger.warn(`⚠️ [${operationId}] All analyses failed`);
+                logger.warn(`⚠️ [${operationId}] All analyses failed - but notification sent`);
             }
 
             return analysisResult;
@@ -136,6 +166,23 @@ class AnalysisOrchestrator {
         }
     }
 
+    // Add the missing getEnabledAnalyses method
+    getEnabledAnalyses() {
+        return this.config.enabledAnalyses || [];
+    }
+
+    // Add the missing getConfig method
+    getConfig() {
+        return {
+            enabledAnalyses: this.config.enabledAnalyses,
+            analysisTimeout: this.config.analysisTimeout,
+            publishResults: this.config.publishResults,
+            maxConcurrentAnalyses: this.config.maxConcurrentAnalyses || 3,
+            botType: this.botType
+        };
+    }
+
+    // Keep all your existing methods...
     async runAnalysisWithTimeout(analysisType, analysisFunction, operationId, cancellationToken) {
         const startTime = Date.now();
         logger.debug(`[${operationId}] Starting ${analysisType} analysis`);
@@ -185,106 +232,118 @@ class AnalysisOrchestrator {
         }
     }
 
-    generateComprehensiveSummary(analysisResult) {
-        const bundleAnalysis = analysisResult.analyses.bundle;
-        const topHoldersAnalysis = analysisResult.analyses.topHolders;
-        
-        const summary = {
-            totalAnalyses: Object.keys(analysisResult.analyses).length,
-            successfulAnalyses: Object.values(analysisResult.analyses).filter(a => a.success).length,
-            failedAnalyses: Object.values(analysisResult.analyses).filter(a => !a.success).length,
-            flags: [],
-            scores: {},
-            alerts: []
-        };
+generateComprehensiveSummary(analysisResult) {
+    const bundleAnalysis = analysisResult.analyses.bundle;
+    const topHoldersAnalysis = analysisResult.analyses.topHolders;
+    
+    const summary = {
+        totalAnalyses: Object.keys(analysisResult.analyses).length,
+        successfulAnalyses: Object.values(analysisResult.analyses).filter(a => a.success).length,
+        failedAnalyses: Object.values(analysisResult.analyses).filter(a => !a.success).length,
+        flags: [],
+        scores: {},
+        alerts: [],
+        analysisError: false // Flag to indicate if analysis failed
+    };
 
-        // Process Bundle Analysis Results
-        if (bundleAnalysis?.success && bundleAnalysis.result) {
-            const bundleResult = bundleAnalysis.result;
-            
-            if (bundleResult.bundleDetected) {
-                summary.flags.push(`🔴 Bundle detected: ${bundleResult.percentageBundled?.toFixed(2)}% of supply`);
-                summary.alerts.push({
-                    type: 'bundle',
-                    severity: 'high',
-                    message: `Bundle activity detected (${bundleResult.percentageBundled?.toFixed(2)}%)`
-                });
-            }
-            
-            summary.scores.bundle = bundleResult.bundleDetected ? 20 : 100; // Lower score = higher risk
-            summary.bundleData = {
-                detected: bundleResult.bundleDetected,
-                percentage: bundleResult.percentageBundled,
-                holdingPercentage: bundleResult.totalHoldingAmountPercentage,
-                bundleCount: bundleResult.bundles?.length || 0
-            };
-        }
-
-        // Process Top Holders Analysis Results
-        if (topHoldersAnalysis?.success && topHoldersAnalysis.result) {
-            const holdersResult = topHoldersAnalysis.result;
-            const holdersSummary = holdersResult.summary;
-            
-            // Add holder-related flags
-            if (holdersSummary.whaleCount > 8) {
-                summary.flags.push(`🔴 High whale concentration: ${holdersSummary.whaleCount}/20 holders`);
-                summary.alerts.push({
-                    type: 'whales',
-                    severity: 'high',
-                    message: `High whale concentration (${holdersSummary.whaleCount}/20)`
-                });
-            } else if (holdersSummary.whaleCount > 5) {
-                summary.flags.push(`🟡 Moderate whale presence: ${holdersSummary.whaleCount}/20 holders`);
-            }
-
-            if (holdersSummary.freshWalletCount > 10) {
-                summary.flags.push(`🔴 High fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
-                summary.alerts.push({
-                    type: 'fresh_wallets',
-                    severity: 'high',
-                    message: `High fresh wallet count (${holdersSummary.freshWalletCount}/20)`
-                });
-            } else if (holdersSummary.freshWalletCount > 5) {
-                summary.flags.push(`🟡 Moderate fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
-            }
-
-            // Add concentration warnings
-            const top5Concentration = parseFloat(holdersSummary.concentration.top5Percentage);
-            if (top5Concentration > 80) {
-                summary.flags.push(`🔴 Very high concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
-                summary.alerts.push({
-                    type: 'concentration',
-                    severity: 'high',
-                    message: `Very high concentration (${top5Concentration.toFixed(1)}%)`
-                });
-            } else if (top5Concentration > 60) {
-                summary.flags.push(`🟡 High concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
-            }
-
-            summary.scores.topHolders = holdersSummary.riskScore;
-            summary.holdersData = {
-                whaleCount: holdersSummary.whaleCount,
-                freshWalletCount: holdersSummary.freshWalletCount,
-                regularWalletCount: holdersSummary.regularWalletCount,
-                concentration: holdersSummary.concentration,
-                riskLevel: holdersSummary.riskLevel
-            };
-        }
-
-        // Calculate overall score and risk level
-        const scores = Object.values(summary.scores).filter(score => typeof score === 'number');
-        summary.overallScore = scores.length > 0 ? 
-            Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length) : 0;
-        
-        summary.riskLevel = this.determineOverallRiskLevel(summary.overallScore, summary.alerts);
-
-        // Add success flags if no major issues
-        if (summary.flags.length === 0) {
-            summary.flags.push('✅ No major red flags detected');
-        }
-
-        analysisResult.summary = summary;
+    // Handle case where both analyses failed (token too new)
+    if (summary.successfulAnalyses === 0) {
+        summary.analysisError = true;
+        summary.flags.push('⚠️ Analysis failed - Token too new for indexing');
+        summary.riskLevel = 'UNKNOWN';
+        summary.overallScore = 0;
+        return summary;
     }
+
+    // Process Bundle Analysis Results
+    if (bundleAnalysis?.success && bundleAnalysis.result) {
+        const bundleResult = bundleAnalysis.result;
+        
+        if (bundleResult.bundleDetected) {
+            summary.flags.push(`🔴 Bundle detected: ${bundleResult.percentageBundled?.toFixed(2)}% of supply`);
+            summary.alerts.push({
+                type: 'bundle',
+                severity: 'high',
+                message: `Bundle activity detected (${bundleResult.percentageBundled?.toFixed(2)}%)`
+            });
+        }
+        
+        summary.scores.bundle = bundleResult.bundleDetected ? 20 : 100;
+        summary.bundleData = {
+            detected: bundleResult.bundleDetected,
+            percentage: bundleResult.percentageBundled,
+            holdingPercentage: bundleResult.totalHoldingAmountPercentage,
+            bundleCount: bundleResult.bundles?.length || 0
+        };
+    } else if (bundleAnalysis && !bundleAnalysis.success) {
+        summary.flags.push('⚠️ Bundle analysis failed');
+    }
+
+    // Process Top Holders Analysis Results (with null check)
+    if (topHoldersAnalysis?.success && topHoldersAnalysis.result && topHoldersAnalysis.result.summary) {
+        const holdersResult = topHoldersAnalysis.result;
+        const holdersSummary = holdersResult.summary;
+        
+        if (holdersSummary.whaleCount > 8) {
+            summary.flags.push(`🔴 High whale concentration: ${holdersSummary.whaleCount}/20 holders`);
+            summary.alerts.push({
+                type: 'whales',
+                severity: 'high',
+                message: `High whale concentration (${holdersSummary.whaleCount}/20)`
+            });
+        } else if (holdersSummary.whaleCount > 5) {
+            summary.flags.push(`🟡 Moderate whale presence: ${holdersSummary.whaleCount}/20 holders`);
+        }
+
+        if (holdersSummary.freshWalletCount > 10) {
+            summary.flags.push(`🔴 High fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
+            summary.alerts.push({
+                type: 'fresh_wallets',
+                severity: 'high',
+                message: `High fresh wallet count (${holdersSummary.freshWalletCount}/20)`
+            });
+        } else if (holdersSummary.freshWalletCount > 5) {
+            summary.flags.push(`🟡 Moderate fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
+        }
+
+        const top5Concentration = parseFloat(holdersSummary.concentration.top5Percentage);
+        if (top5Concentration > 80) {
+            summary.flags.push(`🔴 Very high concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
+            summary.alerts.push({
+                type: 'concentration',
+                severity: 'high',
+                message: `Very high concentration (${top5Concentration.toFixed(1)}%)`
+            });
+        } else if (top5Concentration > 60) {
+            summary.flags.push(`🟡 High concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
+        }
+
+        summary.scores.topHolders = holdersSummary.riskScore;
+        summary.holdersData = {
+            whaleCount: holdersSummary.whaleCount,
+            freshWalletCount: holdersSummary.freshWalletCount,
+            regularWalletCount: holdersSummary.regularWalletCount,
+            concentration: holdersSummary.concentration,
+            riskLevel: holdersSummary.riskLevel
+        };
+    } else if (topHoldersAnalysis && !topHoldersAnalysis.success) {
+        summary.flags.push('⚠️ Top holders analysis failed');
+    }
+
+    // Calculate overall score and risk level
+    const scores = Object.values(summary.scores).filter(score => typeof score === 'number');
+    summary.overallScore = scores.length > 0 ? 
+        Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length) : 0;
+    
+    summary.riskLevel = this.determineOverallRiskLevel(summary.overallScore, summary.alerts);
+
+    // Add success flags if no major issues and at least one analysis succeeded
+    if (summary.flags.length === 0 && summary.successfulAnalyses > 0) {
+        summary.flags.push('✅ No major red flags detected');
+    }
+
+    analysisResult.summary = summary;
+}
 
     determineOverallRiskLevel(score, alerts) {
         const highSeverityAlerts = alerts.filter(alert => alert.severity === 'high').length;
@@ -325,7 +384,6 @@ class AnalysisOrchestrator {
             }
         };
 
-        // Auto-cancel after timeout
         setTimeout(() => {
             if (!token.cancelled) {
                 logger.warn(`Analysis timed out after ${timeout}ms`);
@@ -337,7 +395,6 @@ class AnalysisOrchestrator {
     }
 
     cleanupCompletedAnalyses() {
-        // Keep only last 100 completed analyses
         if (this.completedAnalyses.size > 100) {
             const entries = Array.from(this.completedAnalyses.entries());
             const toDelete = entries.slice(0, entries.length - 100);
@@ -352,22 +409,22 @@ class AnalysisOrchestrator {
 
     getStatus() {
         return {
+            botType: this.botType,
             activeAnalyses: this.activeAnalyses.size,
             completedAnalyses: this.completedAnalyses.size,
             enabledAnalyses: this.config.enabledAnalyses,
             config: {
                 analysisTimeout: this.config.analysisTimeout,
-                publishResults: this.config.publishResults
+                publishResults: this.config.publishResults,
+                maxConcurrentAnalyses: this.config.maxConcurrentAnalyses
             }
         };
     }
 
-    // Get analysis result by operation ID
     getAnalysisResult(operationId) {
         return this.completedAnalyses.get(operationId);
     }
 
-    // Cancel active analysis
     cancelAnalysis(operationId) {
         const cancellationToken = this.activeAnalyses.get(operationId);
         if (cancellationToken) {

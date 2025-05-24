@@ -57,24 +57,28 @@ class TelegramPublisher {
     formatAnalysisMessage(analysisResult) {
         const { tokenInfo, twitterMetrics, analyses, operationId, summary } = analysisResult;
         
-        // Header with token info and overall risk
-        let message = this.formatHeader(tokenInfo, twitterMetrics, summary);
+        // Check if analysis completely failed
+        if (summary && summary.analysisError) {
+            return this.formatFailedAnalysis(tokenInfo, twitterMetrics, operationId, analysisResult.timer);
+        }
+        
+        // Header with token info
+        let message = this.formatHeader(tokenInfo, twitterMetrics);
         
         // Bundle analysis results
         if (analyses.bundle && analyses.bundle.success) {
             message += this.formatBundleAnalysis(analyses.bundle.result);
+        } else if (analyses.bundle && !analyses.bundle.success) {
+            message += '<b>📦 Bundle Analysis:</b>\n• ❌ Analysis failed (token too new)\n\n';
         }
         
         // Top Holders analysis results
         if (analyses.topHolders && analyses.topHolders.success) {
             message += this.formatTopHoldersAnalysis(analyses.topHolders.result);
+        } else if (analyses.topHolders && !analyses.topHolders.success) {
+            message += '<b>👥 Top Holders Analysis:</b>\n• ❌ Analysis failed (token too new)\n\n';
         }
-
-        // Overall summary flags
-        if (summary && summary.flags && summary.flags.length > 0) {
-            message += this.formatSummaryFlags(summary.flags);
-        }
-        
+    
         // Links and footer
         message += this.formatFooter(tokenInfo.address || tokenInfo.mint, operationId, twitterMetrics.link, analysisResult.timer);
         
@@ -86,21 +90,68 @@ class TelegramPublisher {
         return message;
     }
 
-    formatHeader(tokenInfo, twitterMetrics, summary) {
+    formatFailedAnalysis(tokenInfo, twitterMetrics, operationId, timer) {
         const symbol = tokenInfo.symbol || 'Unknown';
         const name = tokenInfo.name || 'Unknown Token';
+        const address = tokenInfo.address || tokenInfo.mint || '';
         const eventType = tokenInfo.eventType === 'migration' ? '🔄 MIGRATION' : '🆕 NEW TOKEN';
         
-        // Add risk level indicator
-        const riskEmoji = this.getRiskEmoji(summary?.riskLevel || 'UNKNOWN');
-        const riskLevel = summary?.riskLevel || 'UNKNOWN';
+        let message = `${eventType} | <b>${symbol}</b>\n`;
+        message += `${name}\n`;
+        message += `<code>${address}</code>\n`;
         
-        let header = `${eventType} | ${riskEmoji} ${riskLevel} | <b>${symbol}</b>\n`;
+        if (twitterMetrics && (twitterMetrics.likes > 0 || twitterMetrics.retweets > 0)) {
+            const likesText = twitterMetrics.likes > 0 ? `${this.formatNumber(twitterMetrics.likes)} likes` : '';
+            const retweetsText = twitterMetrics.retweets > 0 ? `${this.formatNumber(twitterMetrics.retweets)} RT` : '';
+            
+            if (likesText || retweetsText) {
+                const parts = [likesText, retweetsText].filter(Boolean);
+                message += `🐦 Twitter: ${parts.join(' | ')}`;
+                
+                if (twitterMetrics.publishedAt) {
+                    const timeAgo = this.formatTimeAgo(twitterMetrics.publishedAt);
+                    message += ` • ${timeAgo}`;
+                }
+                message += '\n';
+            }
+        }
+        
+        message += '\n';
+        message += '<b>⚠️ Analysis Failed</b>\n';
+        message += '• Token migrated too quickly for indexing\n';
+        message += '• Analysis data not yet available\n';
+        message += '• Check manually using links below\n\n';
+        
+        // Links section
+        message += '<b>🔗 Links:</b>\n';
+        message += `🐦 <a href="${twitterMetrics?.link || '#'}">Tweet</a> | `;
+        message += `📈 <a href="https://dexscreener.com/solana/${address}">DexScreener</a> | `;
+        message += `🔥 <a href="https://pump.fun/${address}">Pump.fun</a> | `;
+        message += `📊 <a href="https://solscan.io/token/${address}">Solscan</a>\n\n`;
+        
+        // Footer with timing
+        if (timer) {
+            message += `<i>Analysis time: ${timer.getElapsedSeconds()}s | ID: ${operationId}</i>`;
+        } else {
+            message += `<i>Analysis ID: ${operationId}</i>`;
+        }
+        
+        return message;
+    }
+
+    formatHeader(tokenInfo, twitterMetrics) {
+        const symbol = tokenInfo.symbol || 'Unknown';
+        const name = tokenInfo.name || 'Unknown Token';
+        const address = tokenInfo.address || tokenInfo.mint || '';
+        const eventType = tokenInfo.eventType === 'migration' ? '🔄 MIGRATION' : '🆕 NEW TOKEN';
+        
+        let header = `${eventType} | <b>${symbol}</b>\n`;
         header += `${name}\n`;
+        header += `<code>${address}</code>\n`;
         
         if (twitterMetrics) {
-            const likesText = twitterMetrics.likes > 0 ? `${formatNumber(twitterMetrics.likes)} likes` : '';
-            const retweetsText = twitterMetrics.retweets > 0 ? `${formatNumber(twitterMetrics.retweets)} RT` : '';
+            const likesText = twitterMetrics.likes > 0 ? `${this.formatNumber(twitterMetrics.likes)} likes` : '';
+            const retweetsText = twitterMetrics.retweets > 0 ? `${this.formatNumber(twitterMetrics.retweets)} RT` : '';
             
             if (likesText || retweetsText) {
                 const parts = [likesText, retweetsText].filter(Boolean);
@@ -139,23 +190,25 @@ class TelegramPublisher {
     }
 
     formatTopHoldersAnalysis(result) {
-        if (!result || !result.summary) return '';
+        if (!result || !result.summary) {
+            return '<b>👥 Top Holders Analysis:</b>\n• Analysis unavailable (token too new)\n\n';
+        }
         
         const summary = result.summary;
-        let section = '<b>👥 Top 20 Holders Analysis:</b>\n';
+        let section = '<b>👥 Top Holders Analysis:</b>\n';
         
-        // Wallet type breakdown (only whales, fresh, and regular)
-        section += `• 🐋 Whales: ${summary.whaleCount}/20 (${summary.whalePercentage}%)\n`;
-        section += `• 🆕 Fresh Wallets: ${summary.freshWalletCount}/20 (${summary.freshWalletPercentage}%)\n`;
-        section += `• 👤 Regular: ${summary.regularWalletCount}/20\n`;
-        
-        // Concentration metrics
-        section += `• Top 5 Holdings: ${summary.concentration.top5Percentage}%\n`;
-        section += `• Top 10 Holdings: ${summary.concentration.top10Percentage}%\n`;
-        
-        // Risk assessment
-        const riskEmoji = this.getRiskEmoji(summary.riskLevel);
-        section += `• Risk Level: ${riskEmoji} ${summary.riskLevel} (Score: ${summary.riskScore}/100)\n`;
+        // Only show if we have meaningful data
+        if (summary.totalHolders > 0) {
+            // Wallet type breakdown (remove Regular count)
+            section += `• 🐋 Whales: ${summary.whaleCount}/20 (${summary.whalePercentage}%)\n`;
+            section += `• 🆕 Fresh Wallets: ${summary.freshWalletCount}/20 (${summary.freshWalletPercentage}%)\n`;
+            
+            // Show top 10 holdings instead of top 5
+            section += `• Top 10 Holdings: ${summary.concentration.top10Percentage}%\n`;
+            
+        } else {
+            section += '• Analysis incomplete (insufficient holder data)\n';
+        }
         
         return section + '\n';
     }
@@ -253,17 +306,6 @@ class TelegramPublisher {
             logger.debug('Error formatting time ago:', error);
             return '';
         }
-    }
-
-    getRiskEmoji(riskLevel) {
-        const riskEmojis = {
-            'LOW': '🟢',
-            'MEDIUM': '🟡',
-            'HIGH': '🟠',
-            'VERY_HIGH': '🔴',
-            'UNKNOWN': '⚪'
-        };
-        return riskEmojis[riskLevel] || riskEmojis['UNKNOWN'];
     }
 
     truncateMessage(message) {

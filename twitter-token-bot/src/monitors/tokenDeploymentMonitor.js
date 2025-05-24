@@ -1,6 +1,5 @@
-// src/monitors/tokenDeploymentMonitor.js - Optimized & Clean Version
+// src/monitors/tokenDeploymentMonitor.js - Streamlined using TwitterValidator
 const EventEmitter = require('events');
-const axios = require('axios');
 const logger = require('../utils/logger');
 const TwitterValidator = require('../validators/twitterValidator');
 const AnalysisOrchestrator = require('../orchestrators/analysisOrchestrator');
@@ -13,11 +12,11 @@ class TokenDeploymentMonitor extends EventEmitter {
         this.config = {
             minTwitterViews: parseInt(process.env.MIN_TWITTER_VIEWS) || config.minTwitterViews || 100000,
             minTwitterLikes: parseInt(process.env.MIN_TWITTER_LIKES) || config.minTwitterLikes || 100,
-            analysisTimeout: parseInt(process.env.ANALYSIS_TIMEOUT) || config.analysisTimeout || 3 * 60 * 1000, // Reduced to 3 min
-            maxConcurrentAnalyses: parseInt(process.env.MAX_CONCURRENT_ANALYSES) || config.maxConcurrentAnalyses || 2, // Reduced to 2
-            processingDelay: parseInt(process.env.PROCESSING_DELAY) || config.processingDelay || 1000, // Reduced to 1s
+            analysisTimeout: parseInt(process.env.ANALYSIS_TIMEOUT) || config.analysisTimeout || 3 * 60 * 1000,
+            maxConcurrentAnalyses: parseInt(process.env.MAX_CONCURRENT_ANALYSES) || config.maxConcurrentAnalyses || 2,
+            processingDelay: parseInt(process.env.PROCESSING_DELAY) || config.processingDelay || 1000,
             enableViewCountExtraction: config.enableViewCountExtraction !== false,
-            viewCountTimeout: config.viewCountTimeout || 10000, // Reduced to 10 seconds
+            viewCountTimeout: config.viewCountTimeout || 10000,
             ...config
         };
 
@@ -26,17 +25,11 @@ class TokenDeploymentMonitor extends EventEmitter {
         logger.info(`   • Min Twitter Likes: ${this.config.minTwitterLikes.toLocaleString()}`);
         logger.info(`   • View Count Extraction: ${this.config.enableViewCountExtraction ? 'Enabled' : 'Disabled'}`);
 
-        // Initialize validators with optimized settings
-        this.quickValidator = new TwitterValidator({
-            enablePageExtraction: false,
-            timeout: 3000, // Reduced timeout
-            maxRetries: 2   // Reduced retries
-        });
-        
-        this.fullValidator = new TwitterValidator({
-            enablePageExtraction: true,
+        // Single TwitterValidator instance
+        this.twitterValidator = new TwitterValidator({
+            enablePageExtraction: this.config.enableViewCountExtraction,
             timeout: this.config.viewCountTimeout,
-            maxRetries: 1   // Only 1 retry for view extraction
+            quickTimeout: 3000
         });
         
         this.analysisOrchestrator = new AnalysisOrchestrator({
@@ -96,21 +89,21 @@ class TokenDeploymentMonitor extends EventEmitter {
 
             this.processedTokens.add(tokenEvent.mint);
 
-            // Extract Twitter link - ONLY status URLs
-            const twitterLink = await this.extractTwitterStatusLink(tokenEvent);
+            // Extract Twitter URL using TwitterValidator
+            const twitterUrl = await this.twitterValidator.extractTwitterUrl(tokenEvent);
 
-            if (!twitterLink) {
+            if (!twitterUrl) {
                 logger.debug(`No valid tweet status URL found for ${tokenEvent.symbol}`);
                 this.stats.tokensSkipped++;
                 return;
             }
 
-            logger.info(`📱 Valid tweet found for ${tokenEvent.symbol}: ${twitterLink}`);
+            logger.info(`📱 Valid tweet found for ${tokenEvent.symbol}: ${twitterUrl}`);
 
             // Add to processing queue
             this.processingQueue.push({
                 tokenEvent,
-                twitterLink,
+                twitterUrl,
                 timestamp: Date.now(),
                 timer
             });
@@ -125,7 +118,7 @@ class TokenDeploymentMonitor extends EventEmitter {
     }
 
     async processQueueItem(item) {
-        const { tokenEvent, twitterLink, timestamp, timer } = item;
+        const { tokenEvent, twitterUrl, timestamp, timer } = item;
         const operationId = timer.operationId;
 
         try {
@@ -138,9 +131,9 @@ class TokenDeploymentMonitor extends EventEmitter {
                 return;
             }
 
-            // STEP 1: Quick likes check (fast validation)
-            logger.debug(`[${operationId}] 🚀 Quick likes check: ${twitterLink}`);
-            const quickMetrics = await this.quickValidator.quickLikesCheck(twitterLink);
+            // STEP 1: Quick likes check
+            logger.debug(`[${operationId}] 🚀 Quick likes check: ${twitterUrl}`);
+            const quickMetrics = await this.twitterValidator.quickLikesCheck(twitterUrl);
 
             if (!quickMetrics || !quickMetrics.likes) {
                 logger.info(`[${operationId}] Twitter validation failed for ${tokenEvent.symbol}`);
@@ -159,7 +152,7 @@ class TokenDeploymentMonitor extends EventEmitter {
 
             // STEP 3: QUALIFIED! Run expensive operations
             logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} qualified with ${quickMetrics.likes} likes! Starting analysis...`);
-            await this.runQualifiedAnalysis(tokenEvent, twitterLink, quickMetrics, operationId, timer);
+            await this.runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer);
 
         } catch (error) {
             logger.error(`[${operationId}] Error processing queue item:`, error);
@@ -167,14 +160,14 @@ class TokenDeploymentMonitor extends EventEmitter {
         }
     }
 
-    async runQualifiedAnalysis(tokenEvent, twitterLink, quickMetrics, operationId, timer) {
+    async runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer) {
         // Check concurrent limit
         if (this.currentlyAnalyzing.size >= this.config.maxConcurrentAnalyses) {
             logger.warn(`[${operationId}] Max concurrent analyses reached, requeuing`);
             setTimeout(() => {
                 this.processingQueue.unshift({ 
                     tokenEvent, 
-                    twitterLink, 
+                    twitterUrl, 
                     timestamp: Date.now(),
                     timer 
                 });
@@ -185,32 +178,18 @@ class TokenDeploymentMonitor extends EventEmitter {
         this.currentlyAnalyzing.add(tokenEvent.mint);
 
         try {
-            let finalTwitterMetrics = {
-                ...quickMetrics,
-                link: twitterLink,
-                views: 0,
-                retweets: 0,
-                replies: 0
-            };
+            let finalTwitterMetrics = quickMetrics;
 
-            // EXPENSIVE OPERATION 1: View extraction (only if enabled)
+            // Get full metrics including views if enabled
             if (this.config.enableViewCountExtraction) {
                 logger.info(`[${operationId}] 📊 Extracting view count...`);
                 try {
                     const viewStart = Date.now();
-                    const fullMetrics = await this.fullValidator.validateEngagement(twitterLink);
+                    const fullMetrics = await this.twitterValidator.validateEngagement(twitterUrl);
                     const viewTime = Date.now() - viewStart;
                     
                     if (fullMetrics && (fullMetrics.views > 0 || fullMetrics.likes > quickMetrics.likes)) {
-                        finalTwitterMetrics = {
-                            link: twitterLink,
-                            views: fullMetrics.views || 0,
-                            likes: Math.max(fullMetrics.likes || 0, quickMetrics.likes || 0),
-                            retweets: fullMetrics.retweets || 0,
-                            replies: fullMetrics.replies || 0,
-                            publishedAt: fullMetrics.publishedAt || quickMetrics.publishedAt
-                        };
-                        
+                        finalTwitterMetrics = fullMetrics;
                         this.stats.viewCountsExtracted++;
                         logger.info(`[${operationId}] ✅ Views extracted (${viewTime}ms): ${finalTwitterMetrics.views} views, ${finalTwitterMetrics.likes} likes`);
                     } else {
@@ -221,7 +200,7 @@ class TokenDeploymentMonitor extends EventEmitter {
                 }
             }
 
-            // EXPENSIVE OPERATION 2: Token analysis (bundle + holders)
+            // Run token analysis
             logger.info(`[${operationId}] 🔬 Running token analysis...`);
             const analysisStart = Date.now();
             
@@ -265,118 +244,6 @@ class TokenDeploymentMonitor extends EventEmitter {
         }
     }
 
-    // OPTIMIZED: Only extract valid tweet status URLs
-    async extractTwitterStatusLink(tokenEvent) {
-        // Check direct fields first
-        const possibleFields = ['twitter', 'social', 'socials'];
-        
-        for (const field of possibleFields) {
-            if (tokenEvent[field]) {
-                const statusUrl = this.findTwitterStatusUrl(tokenEvent[field]);
-                if (statusUrl) {
-                    return statusUrl;
-                }
-            }
-        }
-
-        // Check metadata URI if direct fields failed
-        if (tokenEvent.uri) {
-            return await this.extractTwitterFromUri(tokenEvent.uri);
-        }
-
-        return null;
-    }
-
-    findTwitterStatusUrl(text) {
-        if (!text || typeof text !== 'string') return null;
-        
-        // STRICT: Only accept tweet status URLs
-        const statusPatterns = [
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi
-        ];
-
-        for (const pattern of statusPatterns) {
-            const matches = text.match(pattern);
-            if (matches && matches.length > 0) {
-                const statusUrl = matches[0];
-                logger.debug(`Found valid tweet status: ${statusUrl}`);
-                return statusUrl;
-            }
-        }
-        
-        // Log what we rejected
-        const profilePattern = /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+/gi;
-        const profileMatches = text.match(profilePattern);
-        if (profileMatches && profileMatches.length > 0) {
-            logger.debug(`Rejected Twitter profile URL: ${profileMatches[0]}`);
-        }
-        
-        return null;
-    }
-
-    async extractTwitterFromUri(uri) {
-        try {
-            let fetchUrl = uri;
-            if (uri.startsWith('ipfs://')) {
-                fetchUrl = uri.replace('ipfs://', 'https://ipfs.io/ipfs/');
-            } else if (uri.startsWith('ar://')) {
-                fetchUrl = uri.replace('ar://', 'https://arweave.net/');
-            }
-            
-            const response = await axios.get(fetchUrl, { 
-                timeout: 10000, // Reduced timeout
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (compatible; TokenScanner/1.0)'
-                }
-            });
-            
-            if (response.data) {
-                return this.findTwitterStatusInMetadata(response.data);
-            }
-            return null;
-            
-        } catch (error) {
-            logger.debug(`Failed to fetch metadata from ${uri}: ${error.message}`);
-            return null;
-        }
-    }
-
-    findTwitterStatusInMetadata(metadata) {
-        const statusPatterns = [
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi
-        ];
-        
-        const fieldsToCheck = ['twitter', 'social', 'socials', 'links', 'external_url', 'description'];
-        
-        // Check specific fields
-        for (const field of fieldsToCheck) {
-            if (metadata[field]) {
-                const fieldStr = JSON.stringify(metadata[field]);
-                for (const pattern of statusPatterns) {
-                    const matches = fieldStr.match(pattern);
-                    if (matches && matches.length > 0) {
-                        logger.debug(`Found tweet status in '${field}': ${matches[0]}`);
-                        return matches[0];
-                    }
-                }
-            }
-        }
-        
-        // Check entire metadata as fallback
-        const metadataStr = JSON.stringify(metadata);
-        for (const pattern of statusPatterns) {
-            const matches = metadataStr.match(pattern);
-            if (matches && matches.length > 0) {
-                logger.debug(`Found tweet status in metadata: ${matches[0]}`);
-                return matches[0];
-            }
-        }
-        
-        return null;
-    }
-
     validateTokenEvent(tokenEvent) {
         return tokenEvent && 
                tokenEvent.mint && 
@@ -402,16 +269,14 @@ class TokenDeploymentMonitor extends EventEmitter {
         this.isProcessing = true;
 
         try {
-            // Process larger batches for efficiency
             const batchSize = Math.min(5, this.processingQueue.length);
             const batch = this.processingQueue.splice(0, batchSize);
 
             logger.info(`Processing batch of ${batch.length} items`);
 
-            // Filter out old items before processing
             const validItems = batch.filter(item => {
                 const age = Date.now() - item.timestamp;
-                if (age > 10 * 60 * 1000) { // 10 minutes
+                if (age > 10 * 60 * 1000) {
                     logger.debug(`Filtering out old item: ${item.tokenEvent.symbol}`);
                     this.stats.tokensSkipped++;
                     return false;
@@ -434,11 +299,11 @@ class TokenDeploymentMonitor extends EventEmitter {
 
     startMemoryCleanup() {
         setInterval(() => {
-            if (this.processedTokens.size > 3000) { // Reduced threshold
+            if (this.processedTokens.size > 3000) {
                 logger.info(`Clearing processed tokens cache (${this.processedTokens.size} entries)`);
                 this.processedTokens.clear();
             }
-        }, 5 * 60 * 1000); // Every 5 minutes
+        }, 5 * 60 * 1000);
         
         logger.info('Memory cleanup process started');
     }
@@ -447,8 +312,7 @@ class TokenDeploymentMonitor extends EventEmitter {
         const cleanup = async () => {
             logger.info('🧹 Cleaning up TokenDeploymentMonitor...');
             try {
-                await this.quickValidator.cleanup();
-                await this.fullValidator.cleanup();
+                await this.twitterValidator.cleanup();
                 logger.info('✅ TokenDeploymentMonitor cleanup completed');
             } catch (error) {
                 logger.error('❌ Error during cleanup:', error);
@@ -460,7 +324,7 @@ class TokenDeploymentMonitor extends EventEmitter {
         process.on('exit', cleanup);
     }
 
-    // Status and monitoring methods
+    // Status methods
     getStatus() {
         return {
             processedTokensCount: this.processedTokens.size,
@@ -498,6 +362,13 @@ class TokenDeploymentMonitor extends EventEmitter {
             errors: 0
         };
         logger.info('Statistics reset');
+    }
+
+    clearProcessedTokens() {
+        if (this.processedTokens.size > 1000) {
+            logger.info(`Clearing processed tokens cache (${this.processedTokens.size} entries)`);
+            this.processedTokens.clear();
+        }
     }
 }
 

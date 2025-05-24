@@ -405,11 +405,11 @@ class PumpFunUnifiedApp {
     updateMetrics() {
         this.metrics.uptime = Date.now() - this.startTime;
         
-        // Clean up monitor caches periodically
-        if (this.creationMonitor) {
+        // Clean up monitor caches periodically - but check if methods exist first
+        if (this.creationMonitor && typeof this.creationMonitor.clearProcessedTokens === 'function') {
             this.creationMonitor.clearProcessedTokens();
         }
-        if (this.migrationMonitor) {
+        if (this.migrationMonitor && typeof this.migrationMonitor.clearProcessedTokens === 'function') {
             this.migrationMonitor.clearProcessedTokens();
         }
     }

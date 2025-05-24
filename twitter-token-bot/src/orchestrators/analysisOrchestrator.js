@@ -180,15 +180,13 @@ class AnalysisOrchestrator {
     }
 
     /**
-     * Save analysis result to JSON log
+     * Save analysis result to JSON log - only basics
      */
     async saveToJsonLog(analysisResult) {
         try {
-            logger.debug(`💾 [${analysisResult.operationId}] Saving scan result to JSON...`);
             await this.jsonLogger.saveScanResult(analysisResult);
-            logger.debug(`✅ [${analysisResult.operationId}] Scan result saved to JSON`);
         } catch (error) {
-            logger.error(`❌ [${analysisResult.operationId}] Failed to save scan result to JSON:`, error);
+            // Silent fail to avoid log spam
         }
     }
 

@@ -1,4 +1,4 @@
-// src/publishers/telegramPublisher.js - Updated with Top Holders Analysis
+// src/publishers/telegramPublisher.js - Fixed to properly display views
 const logger = require('../utils/logger');
 const { formatNumber } = require('../utils/formatters');
 
@@ -62,7 +62,7 @@ class TelegramPublisher {
             return this.formatFailedAnalysis(tokenInfo, twitterMetrics, operationId, analysisResult.timer);
         }
         
-        // Header with token info
+        // Header with token info and PROPER Twitter metrics display
         let message = this.formatHeader(tokenInfo, twitterMetrics);
         
         // Bundle analysis results
@@ -100,19 +100,11 @@ class TelegramPublisher {
         message += `${name}\n`;
         message += `<code>${address}</code>\n`;
         
-        if (twitterMetrics && (twitterMetrics.likes > 0 || twitterMetrics.retweets > 0)) {
-            const likesText = twitterMetrics.likes > 0 ? `${this.formatNumber(twitterMetrics.likes)} likes` : '';
-            const retweetsText = twitterMetrics.retweets > 0 ? `${this.formatNumber(twitterMetrics.retweets)} RT` : '';
-            
-            if (likesText || retweetsText) {
-                const parts = [likesText, retweetsText].filter(Boolean);
-                message += `🐦 Twitter: ${parts.join(' | ')}`;
-                
-                if (twitterMetrics.publishedAt) {
-                    const timeAgo = this.formatTimeAgo(twitterMetrics.publishedAt);
-                    message += ` • ${timeAgo}`;
-                }
-                message += '\n';
+        // FIXED: Proper Twitter metrics display for failed analysis
+        if (twitterMetrics) {
+            const twitterLine = this.formatTwitterMetricsLine(twitterMetrics);
+            if (twitterLine) {
+                message += `${twitterLine}\n`;
             }
         }
         
@@ -149,50 +141,69 @@ class TelegramPublisher {
         header += `${name}\n`;
         header += `<code>${address}</code>\n`;
         
+        // FIXED: Use the new Twitter metrics formatting
         if (twitterMetrics) {
-            const engagementParts = [];
-            
-            // Add views if available (priority display)
-            if (twitterMetrics.views && twitterMetrics.views > 0) {
-                engagementParts.push(`👀 ${this.formatNumber(twitterMetrics.views)} views`);
-            }
-            
-            // Add likes (always show if > 0)
-            if (twitterMetrics.likes && twitterMetrics.likes > 0) {
-                engagementParts.push(`❤️ ${this.formatNumber(twitterMetrics.likes)} likes`);
-            }
-            
-            if (engagementParts.length > 0) {
-                header += `🐦 ${engagementParts.join(' • ')}`;
-                
-                // Add time if available
-                if (twitterMetrics.publishedAt) {
-                    const timeAgo = this.formatTimeAgo(twitterMetrics.publishedAt);
-                    header += ` • 📅 ${timeAgo}`;
-                }
-                header += '\n';
+            const twitterLine = this.formatTwitterMetricsLine(twitterMetrics);
+            if (twitterLine) {
+                header += `${twitterLine}\n`;
             }
         }
         
         return header + '\n';
     }
 
+    // NEW METHOD: Properly format Twitter metrics line with views priority
+    formatTwitterMetricsLine(twitterMetrics) {
+        if (!twitterMetrics) return '';
+        
+        const parts = [];
+        
+        // PRIORITY 1: Show views if available (this was missing proper formatting)
+        if (twitterMetrics.views && twitterMetrics.views > 0) {
+            parts.push(`👀 ${this.formatNumber(twitterMetrics.views)} views`);
+        }
+        
+        // PRIORITY 2: Show likes if available  
+        if (twitterMetrics.likes && twitterMetrics.likes > 0) {
+            parts.push(`❤️ ${this.formatNumber(twitterMetrics.likes)} likes`);
+        }
+        
+        // If we have engagement metrics, format the line
+        if (parts.length > 0) {
+            let twitterLine = `🐦 ${parts.join(' • ')}`;
+            
+            // Add time if available
+            if (twitterMetrics.publishedAt) {
+                const timeAgo = this.formatTimeAgo(twitterMetrics.publishedAt);
+                twitterLine += ` • 📅 ${timeAgo}`;
+            }
+            
+            return twitterLine;
+        }
+        
+        return '';
+    }
+
+    // FIXED: Update formatNumber to handle larger numbers correctly
     formatNumber(num) {
-    if (num === null || num === undefined || isNaN(num)) {
-        return '0';
+        if (num === null || num === undefined || isNaN(num)) {
+            return '0';
+        }
+        
+        const absNum = Math.abs(num);
+        
+        if (absNum >= 1000000000) {
+            return (num / 1000000000).toFixed(1) + 'B';
+        }
+        if (absNum >= 1000000) {
+            return (num / 1000000).toFixed(1) + 'M';
+        }
+        if (absNum >= 1000) {
+            return (num / 1000).toFixed(1) + 'K';
+        }
+        
+        return Math.round(num).toLocaleString();
     }
-    
-    const absNum = Math.abs(num);
-    
-    if (absNum >= 1000000) {
-        return (num / 1000000).toFixed(1) + 'M';
-    }
-    if (absNum >= 1000) {
-        return (num / 1000).toFixed(1) + 'K';
-    }
-    
-    return Math.round(num).toLocaleString();
-}
 
     formatBundleAnalysis(result) {
         if (!result) return '';
@@ -233,40 +244,6 @@ class TelegramPublisher {
             
         } else {
             section += '• Analysis incomplete (insufficient holder data)\n';
-        }
-        
-        return section + '\n';
-    }
-
-    formatSummaryFlags(flags) {
-        if (!flags || flags.length === 0) return '';
-        
-        let section = '<b>🚩 Analysis Summary:</b>\n';
-        
-        // Group flags by type for better organization
-        const criticalFlags = flags.filter(flag => flag.includes('🔴'));
-        const warningFlags = flags.filter(flag => flag.includes('🟡'));
-        const successFlags = flags.filter(flag => flag.includes('✅'));
-        
-        // Show critical flags first
-        if (criticalFlags.length > 0) {
-            criticalFlags.forEach(flag => {
-                section += `${flag}\n`;
-            });
-        }
-        
-        // Then warning flags
-        if (warningFlags.length > 0) {
-            warningFlags.forEach(flag => {
-                section += `${flag}\n`;
-            });
-        }
-        
-        // Finally success flags
-        if (successFlags.length > 0 && criticalFlags.length === 0 && warningFlags.length === 0) {
-            successFlags.forEach(flag => {
-                section += `${flag}\n`;
-            });
         }
         
         return section + '\n';

@@ -10,9 +10,7 @@ const config = {
     
     // Twitter scraping settings
     twitter: {
-        minViewsCreation: parseInt(process.env.CREATION_MIN_TWITTER_VIEWS) || 100000,
         minLikesCreation: parseInt(process.env.CREATION_MIN_TWITTER_LIKES) || 100,
-        minViewsMigration: parseInt(process.env.MIGRATION_MIN_TWITTER_VIEWS) || 50000,
         minLikesMigration: parseInt(process.env.MIGRATION_MIN_TWITTER_LIKES) || 1,
         timeout: parseInt(process.env.TWITTER_TIMEOUT) || 15000,
     },

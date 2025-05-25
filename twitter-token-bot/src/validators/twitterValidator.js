@@ -1,4 +1,4 @@
-// Simplified TwitterValidator with URL extraction and validation
+// Cleaned TwitterValidator - Only fast likes + puppeteer views
 const axios = require('axios');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -9,7 +9,6 @@ puppeteer.use(StealthPlugin());
 class TwitterValidator {
     constructor(config = {}) {
         this.config = {
-            timeout: config.timeout || 15000,
             quickTimeout: config.quickTimeout || 5000,
             enablePageExtraction: config.enablePageExtraction !== false,
             ...config
@@ -17,7 +16,7 @@ class TwitterValidator {
 
         this.browser = null;
         this.httpClient = axios.create({
-            timeout: this.config.timeout,
+            timeout: this.config.quickTimeout,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
@@ -25,7 +24,7 @@ class TwitterValidator {
     }
 
     /**
-     * NEW METHOD: Extract Twitter status URL from token event
+     * Extract Twitter status URL from token event
      */
     async extractTwitterUrl(tokenEvent) {
         // Check direct fields first
@@ -46,9 +45,6 @@ class TwitterValidator {
         return null;
     }
 
-    /**
-     * Find valid Twitter status URLs (not profiles)
-     */
     findTwitterStatusUrl(text) {
         if (!text || typeof text !== 'string') return null;
         
@@ -65,9 +61,6 @@ class TwitterValidator {
         return null;
     }
 
-    /**
-     * Extract Twitter URL from metadata URI
-     */
     async extractFromMetadataUri(uri) {
         try {
             let fetchUrl = uri;
@@ -93,9 +86,6 @@ class TwitterValidator {
         }
     }
 
-    /**
-     * Find Twitter status URLs in metadata (strict - status only)
-     */
     findTwitterStatusInMetadata(metadata) {
         const statusPatterns = [
             /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
@@ -126,7 +116,7 @@ class TwitterValidator {
     }
 
     /**
-     * Quick likes check (fast validation)
+     * Fast likes check using syndication API
      */
     async quickLikesCheck(twitterUrl) {
         if (!twitterUrl) return null;
@@ -135,17 +125,28 @@ class TwitterValidator {
         if (!tweetId) return null;
 
         try {
-            const metrics = await this.getQuickMetrics(tweetId);
+            const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en&token=a`;
             
-            if (metrics && metrics.likes > 0) {
-                return {
-                    link: twitterUrl,
-                    likes: metrics.likes,
-                    publishedAt: metrics.publishedAt,
-                    views: 0,
-                    retweets: 0,
-                    replies: 0
-                };
+            const response = await this.httpClient.get(url, {
+                headers: {
+                    'Referer': 'https://platform.twitter.com/',
+                    'Origin': 'https://platform.twitter.com'
+                }
+            });
+
+            if (response.data) {
+                const likes = parseInt(response.data.favorite_count || response.data.favoriteCount || response.data.like_count) || 0;
+                
+                if (likes > 0) {
+                    return {
+                        link: twitterUrl,
+                        likes: likes,
+                        publishedAt: this.parseTwitterDate(response.data.created_at || response.data.created_time),
+                        views: 0,
+                        retweets: 0,
+                        replies: 0
+                    };
+                }
             }
             return null;
 
@@ -156,7 +157,7 @@ class TwitterValidator {
     }
 
     /**
-     * Full validation with views (slower)
+     * Full validation with views using puppeteer
      */
     async validateEngagement(twitterUrl) {
         if (!twitterUrl) return null;
@@ -165,32 +166,29 @@ class TwitterValidator {
         if (!tweetId) return null;
 
         try {
-            // Try API first
-            const apiMetrics = await this.getFullMetrics(tweetId);
-            
-            // If no views and page extraction enabled, try puppeteer
-            if (this.config.enablePageExtraction && (!apiMetrics || apiMetrics.views === 0)) {
+            // Get views from puppeteer if enabled
+            if (this.config.enablePageExtraction) {
                 const pageMetrics = await this.getViewsFromPage(tweetId);
                 if (pageMetrics) {
                     return {
                         link: twitterUrl,
                         views: pageMetrics.views || 0,
-                        likes: Math.max(pageMetrics.likes || 0, apiMetrics?.likes || 0),
+                        likes: pageMetrics.likes || 0,
                         retweets: 0,
                         replies: 0,
-                        publishedAt: pageMetrics.publishedAt || apiMetrics?.publishedAt
+                        publishedAt: null
                     };
                 }
             }
 
-            // Return API metrics or defaults
-            return {
+            // Fallback to just likes
+            return await this.quickLikesCheck(twitterUrl) || {
                 link: twitterUrl,
-                views: apiMetrics?.views || 0,
-                likes: apiMetrics?.likes || 0,
+                views: 0,
+                likes: 0,
                 retweets: 0,
                 replies: 0,
-                publishedAt: apiMetrics?.publishedAt
+                publishedAt: null
             };
 
         } catch (error) {
@@ -207,53 +205,7 @@ class TwitterValidator {
     }
 
     /**
-     * Quick metrics from syndication API
-     */
-    async getQuickMetrics(tweetId) {
-        const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en&token=a`;
-        
-        const response = await this.httpClient.get(url, {
-            timeout: this.config.quickTimeout,
-            headers: {
-                'Referer': 'https://platform.twitter.com/',
-                'Origin': 'https://platform.twitter.com'
-            }
-        });
-
-        if (response.data) {
-            return {
-                likes: parseInt(response.data.favorite_count || response.data.favoriteCount || response.data.like_count) || 0,
-                publishedAt: this.parseTwitterDate(response.data.created_at || response.data.created_time)
-            };
-        }
-        return null;
-    }
-
-    /**
-     * Full metrics from syndication API
-     */
-    async getFullMetrics(tweetId) {
-        const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en&token=a`;
-        
-        const response = await this.httpClient.get(url, {
-            headers: {
-                'Referer': 'https://platform.twitter.com/',
-                'Origin': 'https://platform.twitter.com'
-            }
-        });
-
-        if (response.data) {
-            return {
-                views: parseInt(response.data.view_count || response.data.viewCount) || 0,
-                likes: parseInt(response.data.favorite_count || response.data.favoriteCount || response.data.like_count) || 0,
-                publishedAt: this.parseTwitterDate(response.data.created_at || response.data.created_time)
-            };
-        }
-        return null;
-    }
-
-    /**
-     * Get views from page scraping
+     * Get views from page using puppeteer - targets exact CSS class
      */
     async getViewsFromPage(tweetId) {
         if (!this.browser) {
@@ -272,9 +224,34 @@ class TwitterValidator {
             });
 
             await page.waitForTimeout(3000);
-            const content = await page.content();
+
+            // Get all spans with the exact CSS class for metrics
+            const metrics = await page.evaluate(() => {
+                const spans = document.querySelectorAll('span.css-1jxf684.r-bcqeeo.r-1ttztb7.r-qvutc0.r-poiln3');
+                const numbers = [];
+                
+                spans.forEach(span => {
+                    const text = span.textContent.trim();
+                    if (/^\d+(\.\d+)?[KMB]?$/.test(text)) {
+                        numbers.push(text);
+                    }
+                });
+                
+                return numbers;
+            });
+
+            const parsedNumbers = metrics.map(num => this.parseNumber(num)).filter(n => n > 0);
             
-            return this.parseMetricsFromHtml(content);
+            if (parsedNumbers.length > 0) {
+                // Views are typically the largest number
+                const views = Math.max(...parsedNumbers);
+                // Likes are typically smaller
+                const likes = parsedNumbers.find(n => n < views && n > 0) || 0;
+                
+                return { views, likes };
+            }
+
+            return null;
 
         } catch (error) {
             logger.debug(`Page scraping failed for ${tweetId}: ${error.message}`);
@@ -284,50 +261,6 @@ class TwitterValidator {
         }
     }
 
-    /**
-     * Parse metrics from HTML
-     */
-    parseMetricsFromHtml(html) {
-        const metrics = { views: 0, likes: 0, publishedAt: null };
-
-        // Extract views
-        const viewPatterns = [
-            /"viewCount":"(\d+)"/g,
-            /(\d+(?:,\d{3})*(?:\.\d+)?[KMB]?)\s*(?:Views?|views?)/gi
-        ];
-
-        for (const pattern of viewPatterns) {
-            const matches = [...html.matchAll(pattern)];
-            for (const match of matches) {
-                if (match[1]) {
-                    const viewCount = this.parseNumber(match[1]);
-                    if (viewCount > metrics.views) metrics.views = viewCount;
-                }
-            }
-        }
-
-        // Extract likes
-        const likePatterns = [
-            /"favorite_count":"(\d+)"/g,
-            /(\d+(?:,\d{3})*(?:\.\d+)?[KMB]?)\s*(?:Likes?|likes?)/gi
-        ];
-
-        for (const pattern of likePatterns) {
-            const matches = [...html.matchAll(pattern)];
-            for (const match of matches) {
-                if (match[1]) {
-                    const likeCount = this.parseNumber(match[1]);
-                    if (likeCount > metrics.likes) metrics.likes = likeCount;
-                }
-            }
-        }
-
-        return metrics;
-    }
-
-    /**
-     * Parse numbers with K/M/B suffixes
-     */
     parseNumber(str) {
         if (!str) return 0;
         
@@ -344,9 +277,6 @@ class TwitterValidator {
         return parseInt(clean) || 0;
     }
 
-    /**
-     * Extract tweet ID from URL
-     */
     extractTweetId(url) {
         const patterns = [
             /(?:twitter\.com|x\.com)\/[\w]+\/status\/(\d+)/,
@@ -362,9 +292,6 @@ class TwitterValidator {
         return null;
     }
 
-    /**
-     * Parse Twitter date
-     */
     parseTwitterDate(dateString) {
         if (!dateString) return null;
         

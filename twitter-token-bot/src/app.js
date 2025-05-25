@@ -21,7 +21,6 @@ class PumpFunUnifiedApp {
             
             // Creation Bot Configuration
             creation: {
-                minTwitterViews: config.twitter.minViewsCreation,
                 minTwitterLikes: config.twitter.minLikesCreation,
                 analysisTimeout: config.analysis.timeout,
                 maxConcurrentAnalyses: config.analysis.maxConcurrent,
@@ -36,7 +35,6 @@ class PumpFunUnifiedApp {
             
             // Migration Bot Configuration
             migration: {
-                minTwitterViews: config.twitter.minViewsMigration,
                 minTwitterLikes: config.twitter.minLikesMigration,
                 analysisTimeout: config.analysis.timeout,
                 maxConcurrentAnalyses: config.analysis.maxConcurrent,
@@ -431,13 +429,13 @@ class PumpFunUnifiedApp {
         logger.info(`   • Bot Mode: ${this.botMode.toUpperCase()}`);
         
         if (this.shouldRunCreation()) {
-            logger.info(`   • Creation Min Twitter Views: ${this.config.creation.minTwitterViews.toLocaleString()}`);
+            logger.info(`   • Creation Min Twitter Likes: ${this.config.creation.minTwitterLikes.toLocaleString()}`);
             logger.info(`   • Creation Telegram Channels: ${this.config.creation.telegram.channels.length}`);
             logger.info(`   • Creation Enabled Analyses: ${this.config.creation.enabledAnalyses.join(', ')}`);
         }
         
         if (this.shouldRunMigration()) {
-            logger.info(`   • Migration Min Twitter Views: ${this.config.migration.minTwitterViews.toLocaleString()}`);
+            logger.info(`   • Migration Min Twitter Likes: ${this.config.migration.minTwitterLikes.toLocaleString()}`);
             logger.info(`   • Migration Telegram Channels: ${this.config.migration.telegram.channels.length}`);
             logger.info(`   • Migration Enabled Analyses: ${this.config.migration.enabledAnalyses.join(', ')}`);
         }

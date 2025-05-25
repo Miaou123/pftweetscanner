@@ -1,9 +1,9 @@
-// src/app.js - Unified PumpFun Monitoring Application
+// src/app.js - Unified PumpFun Monitoring Application (FIXED CONFIG)
 const WebSocketManager = require('./services/websocketManager');
 const TokenDeploymentMonitor = require('./monitors/tokenDeploymentMonitor');
 const MigrationMonitor = require('./monitors/migrationMonitor');
 const logger = require('./utils/logger');
-const config = require('./config/monitoringConfig');
+const config = require('./config'); // FIXED: Use simplified config
 
 class PumpFunUnifiedApp {
     constructor(appConfig = {}) {
@@ -21,31 +21,31 @@ class PumpFunUnifiedApp {
             
             // Creation Bot Configuration
             creation: {
-                minTwitterViews: parseInt(process.env.CREATION_MIN_TWITTER_VIEWS) || 100000,
-                minTwitterLikes: parseInt(process.env.CREATION_MIN_TWITTER_LIKES) || 100,
-                analysisTimeout: parseInt(process.env.CREATION_ANALYSIS_TIMEOUT) || 5 * 60 * 1000,
-                maxConcurrentAnalyses: parseInt(process.env.MAX_CONCURRENT_ANALYSES) || 3,
-                processingDelay: parseInt(process.env.PROCESSING_DELAY) || 2000,
+                minTwitterViews: config.twitter.minViewsCreation,
+                minTwitterLikes: config.twitter.minLikesCreation,
+                analysisTimeout: config.analysis.timeout,
+                maxConcurrentAnalyses: config.analysis.maxConcurrent,
+                processingDelay: config.processing.delay,
                 telegram: {
-                    botToken: process.env.TELEGRAM_BOT_TOKEN,
-                    channels: [process.env.CREATION_TELEGRAM_CHANNEL_ID || process.env.TELEGRAM_CHANNEL_ID].filter(Boolean),
+                    botToken: config.telegram.botToken,
+                    channels: config.telegram.creationChannels,
                 },
-                enabledAnalyses: ['bundle'],
+                enabledAnalyses: config.analysis.creation.enabledAnalyses,
                 ...appConfig.creation
             },
             
             // Migration Bot Configuration
             migration: {
-                minTwitterViews: parseInt(process.env.MIGRATION_MIN_TWITTER_VIEWS) || 50000,
-                minTwitterLikes: parseInt(process.env.MIGRATION_MIN_TWITTER_LIKES) || 1,
-                analysisTimeout: parseInt(process.env.MIGRATION_ANALYSIS_TIMEOUT) || 10 * 60 * 1000,
-                maxConcurrentAnalyses: parseInt(process.env.MAX_CONCURRENT_ANALYSES) || 5,
-                processingDelay: parseInt(process.env.PROCESSING_DELAY) || 1000,
+                minTwitterViews: config.twitter.minViewsMigration,
+                minTwitterLikes: config.twitter.minLikesMigration,
+                analysisTimeout: config.analysis.timeout,
+                maxConcurrentAnalyses: config.analysis.maxConcurrent,
+                processingDelay: config.processing.delay,
                 telegram: {
-                    botToken: process.env.TELEGRAM_BOT_TOKEN,
-                    channels: [process.env.MIGRATION_TELEGRAM_CHANNEL_ID].filter(Boolean),
+                    botToken: config.telegram.botToken,
+                    channels: config.telegram.migrationChannels,
                 },
-                enabledAnalyses: ['bundle'],
+                enabledAnalyses: config.analysis.migration.enabledAnalyses,
                 ...appConfig.migration
             },
             
@@ -134,11 +134,8 @@ class PumpFunUnifiedApp {
         logger.info('🔍 Validating configuration...');
 
         // Check required environment variables
-        const required = ['HELIUS_RPC_URL'];
-        const missing = required.filter(key => !process.env[key]);
-        
-        if (missing.length > 0) {
-            throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+        if (!config.heliusRpcUrl) {
+            throw new Error('Missing required environment variable: HELIUS_RPC_URL');
         }
 
         // Validate bot mode
@@ -146,12 +143,7 @@ class PumpFunUnifiedApp {
             throw new Error(`Invalid BOT_MODE: ${this.botMode}. Must be 'creation', 'migration', or 'both'`);
         }
 
-        // Check Twitter configuration (optional since we use scraping)
-        if (!process.env.TWITTER_BEARER_TOKEN && !process.env.X_BEARER_TOKEN) {
-            logger.info('ℹ️  No Twitter API credentials found - using web scraping method for engagement validation');
-        } else {
-            logger.info('ℹ️  Twitter API credentials found - API method available for engagement validation');
-        }
+        logger.info('ℹ️  Using web scraping for Twitter engagement validation (no API tokens required)');
 
         // Validate Telegram configuration based on mode
         if (this.shouldRunCreation() && this.config.creation.telegram.channels.length === 0) {
@@ -405,11 +397,11 @@ class PumpFunUnifiedApp {
     updateMetrics() {
         this.metrics.uptime = Date.now() - this.startTime;
         
-        // Clean up monitor caches periodically - but check if methods exist first
-        if (this.creationMonitor && typeof this.creationMonitor.clearProcessedTokens === 'function') {
+        // Clean up monitor caches periodically
+        if (this.creationMonitor) {
             this.creationMonitor.clearProcessedTokens();
         }
-        if (this.migrationMonitor && typeof this.migrationMonitor.clearProcessedTokens === 'function') {
+        if (this.migrationMonitor) {
             this.migrationMonitor.clearProcessedTokens();
         }
     }
@@ -441,11 +433,13 @@ class PumpFunUnifiedApp {
         if (this.shouldRunCreation()) {
             logger.info(`   • Creation Min Twitter Views: ${this.config.creation.minTwitterViews.toLocaleString()}`);
             logger.info(`   • Creation Telegram Channels: ${this.config.creation.telegram.channels.length}`);
+            logger.info(`   • Creation Enabled Analyses: ${this.config.creation.enabledAnalyses.join(', ')}`);
         }
         
         if (this.shouldRunMigration()) {
             logger.info(`   • Migration Min Twitter Views: ${this.config.migration.minTwitterViews.toLocaleString()}`);
             logger.info(`   • Migration Telegram Channels: ${this.config.migration.telegram.channels.length}`);
+            logger.info(`   • Migration Enabled Analyses: ${this.config.migration.enabledAnalyses.join(', ')}`);
         }
         
         logger.info(`   • Max Concurrent Analyses: ${this.config.creation.maxConcurrentAnalyses}`);

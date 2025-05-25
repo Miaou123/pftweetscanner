@@ -1,11 +1,11 @@
-// Updated AnalysisOrchestrator with JSON logging integration
+// Updated AnalysisOrchestrator with simplified config
 const path = require('path');
 const logger = require('../utils/logger');
 const BundleAnalyzer = require('../analysis/bundleAnalyzer');
 const TopHoldersAnalyzer = require('../analysis/topHoldersAnalyzer');
 const TelegramPublisher = require('../publishers/telegramPublisher');
 const JsonLogger = require('../services/jsonLogger');
-const analysisConfig = require('../config/analysisConfig');
+const config = require('../config'); // FIXED: Use simplified config
 
 class AnalysisOrchestrator {
     constructor(config = {}) {
@@ -19,8 +19,8 @@ class AnalysisOrchestrator {
             ...config
         };
 
-        // Get bot-specific enabled analyses from your analysis config
-        const botSpecificConfig = analysisConfig.getConfigForBot(this.botType);
+        // Get bot-specific enabled analyses from simplified config
+        const botSpecificConfig = require('../config').getConfigForBot(this.botType);
         this.config.enabledAnalyses = botSpecificConfig.enabledAnalyses;
         this.config.maxConcurrentAnalyses = botSpecificConfig.maxConcurrent;
 

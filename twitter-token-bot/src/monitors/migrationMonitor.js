@@ -1,9 +1,9 @@
-// src/monitors/migrationMonitor.js - Streamlined using TwitterValidator
+// src/monitors/migrationMonitor.js - Updated to use PumpFun API for metadata
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
 const TwitterValidator = require('../validators/twitterValidator');
 const AnalysisOrchestrator = require('../orchestrators/analysisOrchestrator');
-const { getSolanaApi } = require('../integrations/solanaApi');
+const pumpfunApi = require('../integrations/pumpfunApi');
 
 class MigrationMonitor extends EventEmitter {
     constructor(config = {}) {
@@ -39,8 +39,6 @@ class MigrationMonitor extends EventEmitter {
             botType: 'migration'
         });
         
-        this.solanaApi = getSolanaApi();
-        
         this.processedTokens = new Set();
         this.processingQueue = [];
         this.currentlyAnalyzing = new Set();
@@ -51,6 +49,7 @@ class MigrationMonitor extends EventEmitter {
             analysesCompleted: 0,
             migrationsSkipped: 0,
             viewCountsExtracted: 0,
+            metadataFetchFailures: 0,
             errors: 0
         };
 
@@ -69,77 +68,183 @@ class MigrationMonitor extends EventEmitter {
             logger.info(`🔄 Processing token migration: ${migrationEvent.mint}`);
             this.stats.migrationsReceived++;
             
-            // Get token metadata
-            let tokenInfo = {
-                mint: migrationEvent.mint,
-                name: migrationEvent.name,
-                symbol: migrationEvent.symbol,
-                uri: migrationEvent.uri
-            };
-    
-            // Fetch from Solana if missing
-            if (!tokenInfo.name || !tokenInfo.symbol) {
-                logger.info(`Fetching token metadata for migration: ${migrationEvent.mint}`);
-                try {
-                    const solanaTokenData = await this.solanaApi.getAsset(migrationEvent.mint);
-                    if (solanaTokenData) {
-                        tokenInfo.name = solanaTokenData.name;
-                        tokenInfo.symbol = solanaTokenData.symbol;
-                        logger.info(`Retrieved token info: ${tokenInfo.name} (${tokenInfo.symbol})`);
-                    }
-                } catch (error) {
-                    logger.warn(`Failed to fetch Solana metadata for ${migrationEvent.mint}:`, error.message);
-                }
-            }
-    
-            if (!tokenInfo.name || !tokenInfo.symbol) {
-                logger.warn(`Could not retrieve token metadata for migration ${migrationEvent.mint}, skipping`);
-                this.stats.migrationsSkipped++;
-                return;
-            }
-    
-            // Create token event structure
-            const tokenEvent = {
-                ...migrationEvent,
-                eventType: 'migration',
-                name: tokenInfo.name,
-                symbol: tokenInfo.symbol,
-                uri: tokenInfo.uri,
-                timer: timer
-            };
-    
-            if (this.processedTokens.has(tokenEvent.mint)) {
-                logger.debug(`Migration token ${tokenEvent.mint} already processed, skipping`);
-                this.stats.migrationsSkipped++;
-                return;
-            }
-    
-            this.processedTokens.add(tokenEvent.mint);
-    
-            // Extract Twitter URL using TwitterValidator
-            const twitterUrl = await this.twitterValidator.extractTwitterUrl(tokenEvent);
-    
-            if (!twitterUrl) {
-                logger.info(`No Twitter link found for migration ${tokenEvent.symbol}, skipping`);
+            if (this.processedTokens.has(migrationEvent.mint)) {
+                logger.debug(`Migration token ${migrationEvent.mint} already processed, skipping`);
                 this.stats.migrationsSkipped++;
                 return;
             }
 
-            logger.info(`📱 Twitter link found for migration ${tokenEvent.symbol}: ${twitterUrl}`);
+            this.processedTokens.add(migrationEvent.mint);
+
+            // STEP 1: Fetch token metadata from PumpFun API
+            logger.debug(`🔍 Fetching token metadata for migration: ${migrationEvent.mint}`);
+            
+            let tokenInfo;
+            try {
+                tokenInfo = await pumpfunApi.getTokenInfo(migrationEvent.mint);
+            } catch (error) {
+                logger.warn(`Failed to fetch token info from PumpFun for ${migrationEvent.mint}:`, error.message);
+                this.stats.metadataFetchFailures++;
+                this.stats.migrationsSkipped++;
+                return;
+            }
+
+            if (!tokenInfo) {
+                logger.warn(`No token info found for migration ${migrationEvent.mint}, skipping`);
+                this.stats.metadataFetchFailures++;
+                this.stats.migrationsSkipped++;
+                return;
+            }
+
+            logger.info(`✅ Token metadata fetched: ${tokenInfo.name} (${tokenInfo.symbol})`);
+
+            // STEP 2: Extract Twitter URL - check both direct fields and metadata_uri
+            const twitterUrl = await this.extractTwitterUrlFromTokenInfo(tokenInfo);
+
+            if (!twitterUrl) {
+                logger.info(`No Twitter status URL found for migration ${tokenInfo.symbol}, skipping`);
+                this.stats.migrationsSkipped++;
+                return;
+            }
+
+            logger.info(`📱 Twitter status URL found for migration ${tokenInfo.symbol}: ${twitterUrl}`);
+
+            // STEP 3: Create complete token event and add to processing queue
+            const completeTokenEvent = {
+                ...migrationEvent,
+                eventType: 'migration',
+                name: tokenInfo.name,
+                symbol: tokenInfo.symbol,
+                timer: timer,
+                // Store the fetched token info
+                tokenInfo: tokenInfo
+            };
+
             this.processingQueue.push({
-                tokenEvent,
+                tokenEvent: completeTokenEvent,
                 twitterUrl,
                 timestamp: Date.now(),
                 eventType: 'migration',
                 timer: timer
             });
-    
-            logger.debug(`Added migration ${tokenEvent.symbol} to processing queue. Queue size: ${this.processingQueue.length}`);
-    
+
+            logger.debug(`Added migration ${tokenInfo.symbol} to processing queue. Queue size: ${this.processingQueue.length}`);
+
         } catch (error) {
             logger.error(`Error processing token migration ${migrationEvent.mint}:`, error);
             this.stats.errors++;
         }
+    }
+
+    async extractTwitterUrlFromTokenInfo(tokenInfo) {
+        // STEP 1: Check direct Twitter field first
+        if (tokenInfo.twitter) {
+            const directTwitterUrl = this.findTwitterStatusUrl(tokenInfo.twitter);
+            if (directTwitterUrl) {
+                logger.debug(`Twitter status URL found in direct field: ${directTwitterUrl}`);
+                return directTwitterUrl;
+            }
+        }
+
+        // STEP 2: Check other fields (website, telegram might contain Twitter links)
+        const fieldsToCheck = ['website', 'telegram', 'description'];
+        for (const field of fieldsToCheck) {
+            if (tokenInfo[field]) {
+                const twitterUrl = this.findTwitterStatusUrl(tokenInfo[field]);
+                if (twitterUrl) {
+                    logger.debug(`Twitter status URL found in ${field} field: ${twitterUrl}`);
+                    return twitterUrl;
+                }
+            }
+        }
+
+        // STEP 3: Check metadata_uri if available
+        if (tokenInfo.metadata_uri) {
+            logger.debug(`Checking metadata_uri for Twitter status URL: ${tokenInfo.metadata_uri}`);
+            try {
+                const metadataTwitterUrl = await this.extractFromMetadataUri(tokenInfo.metadata_uri);
+                if (metadataTwitterUrl) {
+                    logger.debug(`Twitter status URL found in metadata: ${metadataTwitterUrl}`);
+                    return metadataTwitterUrl;
+                }
+            } catch (error) {
+                logger.debug(`Failed to fetch metadata from URI: ${error.message}`);
+            }
+        }
+
+        return null;
+    }
+
+    findTwitterStatusUrl(text) {
+        if (!text || typeof text !== 'string') return null;
+        
+        // Only look for status URLs (tweets), not profiles
+        const statusPatterns = [
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi
+        ];
+
+        for (const pattern of statusPatterns) {
+            const matches = text.match(pattern);
+            if (matches) return matches[0];
+        }
+        
+        return null;
+    }
+
+    async extractFromMetadataUri(uri) {
+        try {
+            let fetchUrl = uri;
+            if (uri.startsWith('ipfs://')) {
+                fetchUrl = uri.replace('ipfs://', 'https://ipfs.io/ipfs/');
+            } else if (uri.startsWith('ar://')) {
+                fetchUrl = uri.replace('ar://', 'https://arweave.net/');
+            }
+            
+            const axios = require('axios');
+            const response = await axios.get(fetchUrl, { 
+                timeout: 10000,
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TokenScanner/1.0)' }
+            });
+            
+            if (response.data) {
+                return this.findTwitterStatusInMetadata(response.data);
+            }
+            return null;
+            
+        } catch (error) {
+            logger.debug(`Failed to fetch metadata from ${uri}: ${error.message}`);
+            return null;
+        }
+    }
+
+    findTwitterStatusInMetadata(metadata) {
+        const statusPatterns = [
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi
+        ];
+        
+        const fieldsToCheck = ['twitter', 'social', 'socials', 'links', 'external_url', 'description'];
+        
+        // Check specific fields first
+        for (const field of fieldsToCheck) {
+            if (metadata[field]) {
+                const fieldStr = JSON.stringify(metadata[field]);
+                for (const pattern of statusPatterns) {
+                    const matches = fieldStr.match(pattern);
+                    if (matches) return matches[0];
+                }
+            }
+        }
+        
+        // Check entire metadata as fallback
+        const metadataStr = JSON.stringify(metadata);
+        for (const pattern of statusPatterns) {
+            const matches = metadataStr.match(pattern);
+            if (matches) return matches[0];
+        }
+        
+        return null;
     }
 
     async processQueueItem(item) {
@@ -354,11 +459,11 @@ class MigrationMonitor extends EventEmitter {
     }
 
     getStatsString() {
-        const { migrationsReceived, migrationsProcessed, analysesCompleted, migrationsSkipped, errors, viewCountsExtracted } = this.stats;
+        const { migrationsReceived, migrationsProcessed, analysesCompleted, migrationsSkipped, errors, viewCountsExtracted, metadataFetchFailures } = this.stats;
         const successRate = migrationsReceived > 0 ? ((analysesCompleted / migrationsReceived) * 100).toFixed(1) : 0;
         const viewExtractionRate = analysesCompleted > 0 ? ((viewCountsExtracted / analysesCompleted) * 100).toFixed(1) : 0;
         
-        return `📊 Migration Stats: ${migrationsReceived} received | ${migrationsProcessed} processed | ${analysesCompleted} analyzed | ${migrationsSkipped} skipped | ${viewCountsExtracted} views (${viewExtractionRate}%) | ${errors} errors | ${successRate}% success rate`;
+        return `📊 Migration Stats: ${migrationsReceived} received | ${migrationsProcessed} processed | ${analysesCompleted} analyzed | ${migrationsSkipped} skipped | ${metadataFetchFailures} metadata failures | ${viewCountsExtracted} views (${viewExtractionRate}%) | ${errors} errors | ${successRate}% success rate`;
     }
 
     resetStats() {
@@ -368,6 +473,7 @@ class MigrationMonitor extends EventEmitter {
             analysesCompleted: 0,
             migrationsSkipped: 0,
             viewCountsExtracted: 0,
+            metadataFetchFailures: 0,
             errors: 0
         };
         logger.info('Migration statistics reset');

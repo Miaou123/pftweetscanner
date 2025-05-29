@@ -1,4 +1,4 @@
-// src/integrations/pumpfunApi.js - FIXED with Browser Pool Management
+// src/integrations/pumpfunApi.js - Updated for Modern Puppeteer
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const UserAgent = require('user-agents');
@@ -6,236 +6,113 @@ const logger = require('../utils/logger');
 
 puppeteer.use(StealthPlugin());
 
-class BrowserPool {
-    constructor(maxBrowsers = 3, maxPagesPerBrowser = 5, browserLifetime = 30 * 60 * 1000) {
-        this.maxBrowsers = maxBrowsers;
-        this.maxPagesPerBrowser = maxPagesPerBrowser;
-        this.browserLifetime = browserLifetime; // 30 minutes
-        this.browsers = [];
-        this.currentBrowserIndex = 0;
-        this.isShuttingDown = false;
-        
-        // Cleanup on process exit
-        process.on('SIGINT', () => this.cleanup());
-        process.on('SIGTERM', () => this.cleanup());
-        process.on('exit', () => this.cleanup());
-    }
-
-    async getBrowser() {
-        // Clean up dead browsers first
-        await this.cleanupDeadBrowsers();
-        
-        // If we have healthy browsers, use round-robin
-        if (this.browsers.length > 0) {
-            const browser = this.browsers[this.currentBrowserIndex];
-            
-            // Check if browser is still alive and not overloaded
-            if (await this.isBrowserHealthy(browser)) {
-                this.currentBrowserIndex = (this.currentBrowserIndex + 1) % this.browsers.length;
-                return browser;
-            } else {
-                // Remove unhealthy browser
-                await this.removeBrowser(this.currentBrowserIndex);
-            }
-        }
-        
-        // Create new browser if we're under the limit
-        if (this.browsers.length < this.maxBrowsers) {
-            const browser = await this.createBrowser();
-            this.browsers.push(browser);
-            logger.info(`🚀 Created browser ${this.browsers.length}/${this.maxBrowsers}`);
-            return browser;
-        }
-        
-        // If all browsers are at capacity, wait and retry
-        logger.warn('⚠️ All browsers at capacity, waiting...');
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        return this.getBrowser(); // Recursive retry
-    }
-
-    async createBrowser() {
-        const browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-accelerated-2d-canvas',
-                '--disable-background-timer-throttling',
-                '--disable-renderer-backgrounding',
-                '--disable-backgrounding-occluded-windows',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-extensions',
-                '--disable-plugins',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor',
-                '--memory-pressure-off' // Prevent memory-based shutdowns
-            ],
-            protocolTimeout: 60000,
-            slowMo: 50,
-        });
-
-        // Track browser metadata
-        browser._createdAt = Date.now();
-        browser._pageCount = 0;
-
-        // Schedule automatic restart after lifetime
-        setTimeout(async () => {
-            if (!this.isShuttingDown) {
-                logger.info('⏰ Browser lifetime expired, scheduling restart...');
-                await this.restartBrowser(browser);
-            }
-        }, this.browserLifetime);
-
-        return browser;
-    }
-
-    async isBrowserHealthy(browser) {
-        try {
-            // Check if browser process is alive
-            await browser.version();
-            
-            // Check page count limit
-            const pages = await browser.pages();
-            if (pages.length > this.maxPagesPerBrowser) {
-                logger.warn(`⚠️ Browser has ${pages.length} pages (max ${this.maxPagesPerBrowser})`);
-                return false;
-            }
-            
-            // Check age limit
-            const age = Date.now() - browser._createdAt;
-            if (age > this.browserLifetime) {
-                logger.info(`⏰ Browser age ${Math.round(age/1000/60)}min exceeds lifetime`);
-                return false;
-            }
-            
-            return true;
-        } catch (error) {
-            logger.debug(`Browser health check failed: ${error.message}`);
-            return false;
-        }
-    }
-
-    async cleanupDeadBrowsers() {
-        const healthyBrowsers = [];
-        
-        for (let i = 0; i < this.browsers.length; i++) {
-            if (await this.isBrowserHealthy(this.browsers[i])) {
-                healthyBrowsers.push(this.browsers[i]);
-            } else {
-                logger.info(`🗑️ Removing unhealthy browser ${i + 1}`);
-                try {
-                    await this.browsers[i].close();
-                } catch (error) {
-                    logger.debug(`Error closing browser: ${error.message}`);
-                }
-            }
-        }
-        
-        this.browsers = healthyBrowsers;
-        this.currentBrowserIndex = 0;
-    }
-
-    async removeBrowser(index) {
-        if (index < this.browsers.length) {
-            const browser = this.browsers[index];
-            try {
-                await browser.close();
-            } catch (error) {
-                logger.debug(`Error closing browser: ${error.message}`);
-            }
-            this.browsers.splice(index, 1);
-            this.currentBrowserIndex = Math.min(this.currentBrowserIndex, this.browsers.length - 1);
-        }
-    }
-
-    async restartBrowser(targetBrowser) {
-        const index = this.browsers.indexOf(targetBrowser);
-        if (index !== -1) {
-            logger.info(`🔄 Restarting browser ${index + 1}`);
-            await this.removeBrowser(index);
-        }
-    }
-
-    async getStats() {
-        const stats = {
-            totalBrowsers: this.browsers.length,
-            browsers: []
-        };
-
-        for (let i = 0; i < this.browsers.length; i++) {
-            const browser = this.browsers[i];
-            try {
-                const pages = await browser.pages();
-                const age = Math.round((Date.now() - browser._createdAt) / 1000 / 60);
-                stats.browsers.push({
-                    index: i,
-                    pages: pages.length,
-                    ageMinutes: age,
-                    healthy: await this.isBrowserHealthy(browser)
-                });
-            } catch (error) {
-                stats.browsers.push({
-                    index: i,
-                    pages: 0,
-                    ageMinutes: 0,
-                    healthy: false,
-                    error: error.message
-                });
-            }
-        }
-
-        return stats;
-    }
-
-    async cleanup() {
-        if (this.isShuttingDown) return;
-        this.isShuttingDown = true;
-        
-        logger.info('🧹 Shutting down browser pool...');
-        
-        const closePromises = this.browsers.map(async (browser, index) => {
-            try {
-                await browser.close();
-                logger.debug(`✅ Browser ${index + 1} closed`);
-            } catch (error) {
-                logger.debug(`❌ Error closing browser ${index + 1}: ${error.message}`);
-            }
-        });
-        
-        await Promise.allSettled(closePromises);
-        this.browsers = [];
-        logger.info('✅ Browser pool cleanup completed');
-    }
-}
-
 class PumpFunApi {
     constructor() {
         this.baseUrl = 'https://frontend-api-v3.pump.fun';
+        this.browser = null;
         this.maxRetries = 3;
         this.retryDelay = 2000;
-        
-        // Create browser pool with 3 browsers max
-        this.browserPool = new BrowserPool(3, 5, 20 * 60 * 1000); // 3 browsers, 5 pages each, 20min lifetime
+        this.browserRestartCount = 0;
+        this.maxBrowserRestarts = 5;
+        this.lastBrowserRestart = 0;
+        this.minRestartInterval = 60000; // 1 minute between restarts
+    }
+
+    async initializeBrowser() {
+        // Check if we need to restart browser due to age or errors
+        const now = Date.now();
+        const shouldRestart = this.browserRestartCount > 0 && 
+                             (now - this.lastBrowserRestart) > this.minRestartInterval;
+
+        if (this.browser && !shouldRestart) {
+            // Check if browser is still connected
+            try {
+                await this.browser.version();
+                return; // Browser is still working
+            } catch (error) {
+                logger.warn('Browser connection lost, reinitializing...');
+                await this.closeBrowser();
+            }
+        }
+
+        if (shouldRestart) {
+            logger.info('Proactively restarting browser due to previous errors');
+            await this.closeBrowser();
+        }
+
+        try {
+            logger.debug('Launching new Puppeteer browser...');
+            
+            this.browser = await puppeteer.launch({
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-accelerated-2d-canvas',
+                    '--disable-background-timer-throttling',
+                    '--disable-renderer-backgrounding',
+                    '--disable-backgrounding-occluded-windows',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-extensions',
+                    '--disable-plugins',
+                    '--disable-web-security',
+                    '--disable-features=VizDisplayCompositor',
+                    '--memory-pressure-off',
+                    '--max_old_space_size=4096'
+                ],
+                // Updated timeouts for modern Puppeteer
+                protocolTimeout: 60000, // 60 seconds
+                slowMo: 50, // Small delay between actions
+                defaultViewport: {
+                    width: 1920,
+                    height: 1080
+                }
+            });
+            
+            this.browserRestartCount = 0;
+            this.lastBrowserRestart = now;
+            logger.debug('✅ PumpFun browser initialized successfully');
+
+            // Handle browser disconnection
+            this.browser.on('disconnected', () => {
+                logger.warn('⚠️ Browser disconnected unexpectedly');
+                this.browser = null;
+            });
+
+        } catch (error) {
+            logger.error('❌ Failed to initialize browser:', error);
+            throw error;
+        }
     }
 
     async configurePage(page) {
         try {
+            // Modern Puppeteer page configuration
             const userAgent = new UserAgent();
             await page.setUserAgent(userAgent.toString());
             
-            await page.setDefaultTimeout(30000);
-            await page.setDefaultNavigationTimeout(30000);
+            // Set timeouts (modern Puppeteer syntax)
+            page.setDefaultTimeout(30000);
+            page.setDefaultNavigationTimeout(30000);
             
+            // Set headers
             await page.setExtraHTTPHeaders({
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Referer': 'https://pump.fun/',
                 'Origin': 'https://pump.fun',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Linux"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'cross-site'
             });
 
+            // Request interception for performance
             await page.setRequestInterception(true);
             page.on('request', (req) => {
                 const resourceType = req.resourceType();
@@ -245,59 +122,91 @@ class PumpFunApi {
                     req.continue();
                 }
             });
+
         } catch (error) {
-            logger.error('Failed to configure page:', error);
+            logger.error('❌ Failed to configure page:', error);
             throw error;
         }
     }
 
     async fetchData(url, retryCount = 0) {
         let page = null;
-        let browser = null;
 
         try {
-            // Get browser from pool (reuses existing browsers!)
-            browser = await this.browserPool.getBrowser();
-            page = await browser.newPage();
+            await this.initializeBrowser();
+            
+            page = await this.browser.newPage();
             await this.configurePage(page);
             
-            logger.debug(`Fetching data from: ${url}`);
+            logger.debug(`🌐 Fetching data from: ${url}`);
             
+            // Navigate with better error handling
             await page.goto(url, { 
                 waitUntil: 'domcontentloaded', 
                 timeout: 30000 
             });
 
-            await page.waitForTimeout(1000);
+            // FIXED: Use modern Puppeteer delay method
+            await this.waitForDelay(page, 1000);
+
+            // Extract content
             const bodyText = await page.evaluate(() => document.body.innerText);
+
+            // Validate and parse response
+            if (!bodyText || bodyText.trim() === '') {
+                throw new Error('Empty response body');
+            }
 
             try {
                 const data = JSON.parse(bodyText);
+                
+                // Check for error responses that still return 200
+                if (data.error || data.message || (typeof data === 'object' && Object.keys(data).length === 0)) {
+                    throw new Error(`API Error: ${data.error || data.message || 'Empty response object'}`);
+                }
+                
                 return data;
             } catch (parseError) {
                 logger.error(`JSON parsing error for URL: ${url}`);
-                logger.debug(`Response body: ${bodyText.substring(0, 200)}...`);
+                logger.debug(`Response body (first 200 chars): ${bodyText.substring(0, 200)}...`);
+                
+                // Check if response is HTML (error page)
+                if (bodyText.includes('<html>') || bodyText.includes('<!DOCTYPE')) {
+                    throw new Error('Received HTML error page instead of JSON');
+                }
+                
                 throw new Error(`JSON parsing failed: ${parseError.message}`);
             }
 
         } catch (error) {
-            logger.error(`Error fetching data from ${url}:`, error.message);
+            logger.error(`❌ Error fetching data from ${url}:`, error.message);
+            
+            // Handle browser-specific errors
+            if (this.isBrowserError(error)) {
+                logger.warn('🔄 Browser error detected, will restart browser');
+                await this.closeBrowser();
+                this.browserRestartCount++;
+                
+                if (this.browserRestartCount < this.maxBrowserRestarts) {
+                    logger.info(`🔄 Restarting browser (attempt ${this.browserRestartCount}/${this.maxBrowserRestarts})`);
+                    await this.waitForDelay(null, 2000); // Wait before restart
+                }
+            }
             
             // Retry logic
             if (retryCount < this.maxRetries) {
                 const delay = this.retryDelay * (retryCount + 1);
-                logger.info(`Retrying request (${retryCount + 1}/${this.maxRetries}) after ${delay}ms`);
-                await new Promise(resolve => setTimeout(resolve, delay));
+                logger.info(`🔄 Retrying request (${retryCount + 1}/${this.maxRetries}) after ${delay}ms`);
+                await this.waitForDelay(null, delay);
                 return this.fetchData(url, retryCount + 1);
             }
             
             throw error;
         } finally {
-            // CRITICAL: Always close the page (tab) but NOT the browser
+            // Always close the page
             if (page) {
                 try {
-                    await page.close(); // ✅ Close tab
-                    // ❌ DO NOT call browser.close() - browser stays in pool!
+                    await page.close();
                 } catch (closeError) {
                     logger.debug('Error closing page:', closeError.message);
                 }
@@ -305,7 +214,39 @@ class PumpFunApi {
         }
     }
 
-    // Rest of your methods stay the same
+    // FIXED: Universal delay method that works with all Puppeteer versions
+    async waitForDelay(page, ms) {
+        try {
+            if (page && typeof page.waitForTimeout === 'function') {
+                // Modern Puppeteer (v1.12+)
+                await page.waitForTimeout(ms);
+            } else if (page && typeof page.waitFor === 'function') {
+                // Legacy Puppeteer (v1.0-1.11)
+                await page.waitFor(ms);
+            } else {
+                // Universal fallback
+                await new Promise(resolve => setTimeout(resolve, ms));
+            }
+        } catch (error) {
+            // If page methods fail, use universal fallback
+            await new Promise(resolve => setTimeout(resolve, ms));
+        }
+    }
+
+    isBrowserError(error) {
+        const browserErrorPatterns = [
+            /Protocol error/i,
+            /Connection closed/i,
+            /Target closed/i,
+            /Session closed/i,
+            /Browser has been closed/i,
+            /Navigation failed/i,
+            /Frame was detached/i
+        ];
+        
+        return browserErrorPatterns.some(pattern => pattern.test(error.message));
+    }
+
     async getAllTrades(tokenAddress, limit = 200, offset = 0, minimumSize = 0) {
         if (!tokenAddress) {
             throw new Error("Token address is required");
@@ -321,11 +262,11 @@ class PumpFunApi {
                 return [];
             }
 
-            logger.debug(`Fetched ${data.length} trades for token ${tokenAddress}`);
+            logger.debug(`📊 Fetched ${data.length} trades for token ${tokenAddress}`);
             return data;
 
         } catch (error) {
-            logger.error(`Failed to fetch trades for token ${tokenAddress}:`, error);
+            logger.error(`❌ Failed to fetch trades for token ${tokenAddress}:`, error);
             throw error;
         }
     }
@@ -339,9 +280,22 @@ class PumpFunApi {
         
         try {
             const data = await this.fetchData(url);
+            
+            // Additional validation for token info
+            if (data && typeof data === 'object') {
+                // Check if it has expected token fields
+                const hasTokenFields = data.name || data.symbol || data.description || data.created_timestamp;
+                if (!hasTokenFields) {
+                    logger.warn(`Token info response missing expected fields for ${tokenAddress}`);
+                    throw new Error('Invalid token info structure');
+                }
+                
+                logger.debug(`✅ Token info fetched: ${data.name || 'Unknown'} (${data.symbol || 'Unknown'})`);
+            }
+            
             return data;
         } catch (error) {
-            logger.error(`Failed to fetch token info for ${tokenAddress}:`, error);
+            logger.error(`❌ Failed to fetch token info for ${tokenAddress}:`, error);
             throw error;
         }
     }
@@ -357,21 +311,73 @@ class PumpFunApi {
             const data = await this.fetchData(url);
             return Array.isArray(data) ? data : [];
         } catch (error) {
-            logger.error(`Failed to fetch user trades for ${userAddress}:`, error);
+            logger.error(`❌ Failed to fetch user trades for ${userAddress}:`, error);
             throw error;
         }
     }
 
-    // Updated cleanup - uses browser pool
+    async closeBrowser() {
+        if (this.browser) {
+            try {
+                await this.browser.close();
+                this.browser = null;
+                logger.debug('🔒 PumpFun browser closed');
+            } catch (error) {
+                logger.error('❌ Error closing browser:', error);
+                this.browser = null; // Force null even if close failed
+            }
+        }
+    }
+
+    // Enhanced cleanup method
     async cleanup() {
-        logger.info('🧹 Cleaning up PumpFun API...');
-        await this.browserPool.cleanup();
+        logger.info('🧹 Cleaning up PumpFun API resources...');
+        await this.closeBrowser();
         logger.info('✅ PumpFun API cleanup completed');
     }
 
-    // Health check with pool stats
-    async getStats() {
-        return await this.browserPool.getStats();
+    // Health check method
+    async healthCheck() {
+        try {
+            if (!this.browser) {
+                return { healthy: false, reason: 'No browser instance' };
+            }
+            
+            await this.browser.version();
+            return { 
+                healthy: true, 
+                browserRestarts: this.browserRestartCount,
+                lastRestart: this.lastBrowserRestart 
+            };
+        } catch (error) {
+            return { 
+                healthy: false, 
+                reason: error.message,
+                browserRestarts: this.browserRestartCount 
+            };
+        }
+    }
+
+    // Test method for debugging
+    async testFetch(tokenAddress) {
+        logger.info(`🧪 Testing fetch for token: ${tokenAddress}`);
+        
+        try {
+            const startTime = Date.now();
+            const data = await this.getTokenInfo(tokenAddress);
+            const duration = Date.now() - startTime;
+            
+            logger.info(`✅ Test successful in ${duration}ms:`);
+            logger.info(`   Name: ${data.name || 'N/A'}`);
+            logger.info(`   Symbol: ${data.symbol || 'N/A'}`);
+            logger.info(`   Created: ${data.created_timestamp || 'N/A'}`);
+            
+            return { success: true, data, duration };
+            
+        } catch (error) {
+            logger.error(`❌ Test failed: ${error.message}`);
+            return { success: false, error: error.message };
+        }
     }
 }
 

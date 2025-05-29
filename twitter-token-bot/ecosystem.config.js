@@ -4,24 +4,35 @@ module.exports = {
       name: 'twitter-token-bot',
       script: 'src/app.js',
       cwd: '/home/deployer/pftweetscanner/twitter-token-bot',
-      instances: 1,
-      exec_mode: 'fork',
+      
+      // EXACTEMENT la même config que ton .env
       env: {
-        NODE_ENV: 'production',
-        BOT_MODE: 'both'
+        NODE_ENV: 'development',      // Exactement comme ton .env
+        LOG_LEVEL: 'info',            // Exactement comme ton .env
+        BOT_MODE: 'both'              // Exactement comme ton .env
       },
+      
+      // DÉSACTIVER complètement les logs PM2
+      out_file: '/dev/null',          // Pas de logs PM2
+      error_file: '/dev/null',        // Pas de logs PM2  
+      log_file: '/dev/null',          // Pas de logs PM2
+      
+      // Utiliser SEULEMENT winston (comme npm start)
+      combine_logs: false,
+      merge_logs: false,
+      
+      // Options PM2 minimales
       autorestart: true,
-      watch: false,
       max_memory_restart: '1G',
-      log_file: './logs/combined.log',
-      out_file: './logs/out.log',
-      error_file: './logs/error.log',
-      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
-      restart_delay: 4000,
-      max_restarts: 10,
-      min_uptime: '10s',
-      kill_timeout: 5000,
-      env_file: '.env'
+      min_uptime: '5s',
+      
+      // Charger ton .env
+      env_file: '.env',
+      
+      // Pas d'options supplémentaires qui causent du debug
+      exec_mode: 'fork',
+      instances: 1
     }
   ]
 };
+

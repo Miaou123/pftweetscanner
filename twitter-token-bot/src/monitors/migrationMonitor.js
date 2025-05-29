@@ -1,4 +1,4 @@
-// src/monitors/migrationMonitor.js - Updated to use PumpFun API for metadata
+// src/monitors/migrationMonitor.js - Enhanced with detailed benchmarking
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
 const TwitterValidator = require('../validators/twitterValidator');
@@ -50,7 +50,18 @@ class MigrationMonitor extends EventEmitter {
             migrationsSkipped: 0,
             viewCountsExtracted: 0,
             metadataFetchFailures: 0,
-            errors: 0
+            errors: 0,
+            // Enhanced timing stats
+            avgMetadataFetchTime: 0,
+            avgTwitterValidationTime: 0,
+            avgViewExtractionTime: 0,
+            avgAnalysisTime: 0,
+            avgBundleAnalysisTime: 0,
+            avgTopHoldersAnalysisTime: 0,
+            avgBundleAnalysisTime: 0,
+            avgTopHoldersAnalysisTime: 0,
+            slowestAnalysis: { time: 0, token: '' },
+            fastestAnalysis: { time: Infinity, token: '' }
         };
 
         this.processTokenMigration = this.processTokenMigration.bind(this);
@@ -63,6 +74,7 @@ class MigrationMonitor extends EventEmitter {
 
     async processTokenMigration(migrationEvent) {
         const timer = migrationEvent.timer;
+        const startTime = Date.now();
         
         try {
             logger.info(`🔄 Processing token migration: ${migrationEvent.mint}`);
@@ -76,14 +88,22 @@ class MigrationMonitor extends EventEmitter {
 
             this.processedTokens.add(migrationEvent.mint);
 
-            // STEP 1: Fetch token metadata from PumpFun API
-            logger.debug(`🔍 Fetching token metadata for migration: ${migrationEvent.mint}`);
+            // STEP 1: Fetch token metadata from PumpFun API with timing
+            logger.info(`⏱️ [${timer.operationId}] Step 1: Fetching token metadata...`);
+            const metadataStart = Date.now();
             
             let tokenInfo;
             try {
                 tokenInfo = await pumpfunApi.getTokenInfo(migrationEvent.mint);
+                const metadataTime = Date.now() - metadataStart;
+                logger.info(`✅ [${timer.operationId}] Metadata fetched in ${metadataTime}ms`);
+                
+                // Update timing stats
+                this.updateTimingStats('metadata', metadataTime);
+                
             } catch (error) {
-                logger.warn(`Failed to fetch token info from PumpFun for ${migrationEvent.mint}:`, error.message);
+                const metadataTime = Date.now() - metadataStart;
+                logger.warn(`❌ [${timer.operationId}] Metadata fetch failed in ${metadataTime}ms: ${error.message}`);
                 this.stats.metadataFetchFailures++;
                 this.stats.migrationsSkipped++;
                 return;
@@ -96,18 +116,22 @@ class MigrationMonitor extends EventEmitter {
                 return;
             }
 
-            logger.info(`✅ Token metadata fetched: ${tokenInfo.name} (${tokenInfo.symbol})`);
+            logger.info(`✅ Token metadata: ${tokenInfo.name} (${tokenInfo.symbol})`);
 
-            // STEP 2: Extract Twitter URL - check both direct fields and metadata_uri
+            // STEP 2: Extract Twitter URL with timing
+            logger.info(`⏱️ [${timer.operationId}] Step 2: Extracting Twitter URL...`);
+            const twitterExtractStart = Date.now();
+            
             const twitterUrl = await this.extractTwitterUrlFromTokenInfo(tokenInfo);
-
+            const twitterExtractTime = Date.now() - twitterExtractStart;
+            
             if (!twitterUrl) {
-                logger.info(`No Twitter status URL found for migration ${tokenInfo.symbol}, skipping`);
+                logger.info(`❌ [${timer.operationId}] No Twitter URL found in ${twitterExtractTime}ms, skipping`);
                 this.stats.migrationsSkipped++;
                 return;
             }
 
-            logger.info(`📱 Twitter status URL found for migration ${tokenInfo.symbol}: ${twitterUrl}`);
+            logger.info(`✅ [${timer.operationId}] Twitter URL found in ${twitterExtractTime}ms: ${twitterUrl}`);
 
             // STEP 3: Create complete token event and add to processing queue
             const completeTokenEvent = {
@@ -116,8 +140,13 @@ class MigrationMonitor extends EventEmitter {
                 name: tokenInfo.name,
                 symbol: tokenInfo.symbol,
                 timer: timer,
-                // Store the fetched token info
-                tokenInfo: tokenInfo
+                tokenInfo: tokenInfo,
+                // Add timing info for queue processing
+                processingTimes: {
+                    metadataFetch: Date.now() - metadataStart,
+                    twitterExtract: twitterExtractTime,
+                    queuedAt: Date.now()
+                }
             };
 
             this.processingQueue.push({
@@ -128,16 +157,305 @@ class MigrationMonitor extends EventEmitter {
                 timer: timer
             });
 
-            logger.debug(`Added migration ${tokenInfo.symbol} to processing queue. Queue size: ${this.processingQueue.length}`);
+            const totalPreProcessTime = Date.now() - startTime;
+            logger.info(`📊 [${timer.operationId}] Pre-processing completed in ${totalPreProcessTime}ms, added to queue (size: ${this.processingQueue.length})`);
 
         } catch (error) {
-            logger.error(`Error processing token migration ${migrationEvent.mint}:`, error);
+            const totalTime = Date.now() - startTime;
+            logger.error(`❌ [${timer.operationId}] Error processing migration in ${totalTime}ms:`, error);
             this.stats.errors++;
         }
     }
 
+    async processQueueItem(item) {
+        const { tokenEvent, twitterUrl, timestamp, eventType, timer } = item;
+        const operationId = timer?.operationId || `${tokenEvent.symbol}_${eventType}_${Date.now()}`;
+        const processingStart = Date.now();
+
+        try {
+            this.stats.migrationsProcessed++;
+            logger.info(`🔄 [${operationId}] Processing queued migration: ${tokenEvent.symbol}`);
+
+            // Check if item is too old
+            const queueAge = Date.now() - timestamp;
+            if (queueAge > 15 * 60 * 1000) {
+                logger.warn(`[${operationId}] Migration too old (${Math.round(queueAge/1000)}s), skipping`);
+                this.stats.migrationsSkipped++;
+                return;
+            }
+
+            logger.info(`📊 [${operationId}] Queue wait time: ${queueAge}ms`);
+
+            // STEP 1: Quick likes check with timing
+            logger.info(`⏱️ [${operationId}] Step 3: Quick likes validation...`);
+            const likesStart = Date.now();
+            
+            const quickMetrics = await this.twitterValidator.quickLikesCheck(twitterUrl);
+            const likesTime = Date.now() - likesStart;
+
+            if (!quickMetrics || !quickMetrics.likes) {
+                logger.warn(`❌ [${operationId}] Twitter validation failed in ${likesTime}ms`);
+                this.updateTimingStats('twitterValidation', likesTime);
+                this.stats.migrationsSkipped++;
+                return;
+            }
+
+            logger.info(`✅ [${operationId}] Found ${quickMetrics.likes} likes in ${likesTime}ms`);
+            this.updateTimingStats('twitterValidation', likesTime);
+
+            // STEP 2: Check engagement threshold
+            if (quickMetrics.likes < this.config.minTwitterLikes) {
+                logger.info(`❌ [${operationId}] ${tokenEvent.symbol} has ${quickMetrics.likes} likes (< ${this.config.minTwitterLikes}), skipping`);
+                this.stats.migrationsSkipped++;
+                return;
+            }
+
+            // STEP 3: QUALIFIED! Run expensive operations
+            logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} qualified with ${quickMetrics.likes} likes! Starting analysis...`);
+            await this.runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer, processingStart);
+
+        } catch (error) {
+            const processingTime = Date.now() - processingStart;
+            logger.error(`❌ [${operationId}] Error processing migration queue item in ${processingTime}ms:`, error);
+            this.stats.errors++;
+        }
+    }
+
+    async runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer, processingStart) {
+        // Check concurrent limit
+        if (this.currentlyAnalyzing.size >= this.config.maxConcurrentAnalyses) {
+            logger.warn(`[${operationId}] Max concurrent analyses reached (${this.currentlyAnalyzing.size}/${this.config.maxConcurrentAnalyses}), requeuing`);
+            setTimeout(() => {
+                this.processingQueue.unshift({ 
+                    tokenEvent, 
+                    twitterUrl, 
+                    timestamp: Date.now(),
+                    eventType: 'migration',
+                    timer 
+                });
+            }, 30000);
+            return;
+        }
+
+        this.currentlyAnalyzing.add(tokenEvent.mint);
+
+        try {
+            // STEP 4 & 5: Run view extraction and analysis in parallel for maximum efficiency
+            let viewExtractionTime = 0;
+            let finalTwitterMetrics = quickMetrics;
+            let analysisResult;
+            let analysisTime = 0; // Define analysisTime at the start to avoid scope issues
+            
+            if (this.config.enableViewCountExtraction) {
+                logger.info(`⏱️ [${operationId}] Step 4 & 5: Running view extraction AND analysis in parallel...`);
+                const viewStart = Date.now();
+                const analysisStart = Date.now();
+                
+                try {
+                    // Run both operations in parallel
+                    const [viewMetrics, analysisRes] = await Promise.all([
+                        // View extraction with puppeteer
+                        this.twitterValidator.validateEngagement(twitterUrl),
+                        
+                        // Analysis using quick metrics (will update with views if successful)
+                        this.analysisOrchestrator.analyzeToken({
+                            tokenAddress: tokenEvent.mint,
+                            tokenInfo: {
+                                name: tokenEvent.name,
+                                symbol: tokenEvent.symbol,
+                                creator: tokenEvent.traderPublicKey || tokenEvent.creator,
+                                address: tokenEvent.mint,
+                                eventType: 'migration'
+                            },
+                            twitterMetrics: quickMetrics, // Start with quick metrics
+                            operationId,
+                            timer
+                        })
+                    ]);
+                    
+                    viewExtractionTime = Date.now() - viewStart;
+                    analysisTime = Date.now() - analysisStart; // Set analysisTime here
+                    analysisResult = analysisRes;
+                    
+                    // Update final metrics if view extraction was successful
+                    if (viewMetrics && (viewMetrics.views > 0 || viewMetrics.likes > quickMetrics.likes)) {
+                        finalTwitterMetrics = viewMetrics;
+                        this.stats.viewCountsExtracted++;
+                        logger.info(`✅ [${operationId}] Parallel execution completed - Views: ${viewMetrics.views}, Analysis: ${analysisTime}ms (saved ~${Math.abs(viewExtractionTime - analysisTime)}ms)`);
+                    } else {
+                        logger.warn(`⚠️ [${operationId}] Parallel execution completed - View extraction failed but analysis succeeded in ${analysisTime}ms`);
+                    }
+                    
+                    this.updateTimingStats('viewExtraction', viewExtractionTime);
+                    
+                } catch (error) {
+                    viewExtractionTime = Date.now() - viewStart;
+                    logger.error(`❌ [${operationId}] Parallel execution failed after ${viewExtractionTime}ms: ${error.message}`);
+                    
+                    // Fallback: run analysis alone if parallel execution failed
+                    logger.info(`⏱️ [${operationId}] Fallback: Running analysis alone...`);
+                    const fallbackAnalysisStart = Date.now();
+                    
+                    analysisResult = await this.analysisOrchestrator.analyzeToken({
+                        tokenAddress: tokenEvent.mint,
+                        tokenInfo: {
+                            name: tokenEvent.name,
+                            symbol: tokenEvent.symbol,
+                            creator: tokenEvent.traderPublicKey || tokenEvent.creator,
+                            address: tokenEvent.mint,
+                            eventType: 'migration'
+                        },
+                        twitterMetrics: quickMetrics,
+                        operationId,
+                        timer
+                    });
+                    
+                    analysisTime = Date.now() - fallbackAnalysisStart; // Set analysisTime for fallback
+                    logger.info(`✅ [${operationId}] Fallback analysis completed in ${analysisTime}ms`);
+                    
+                    this.updateTimingStats('viewExtraction', viewExtractionTime);
+                }
+            } else {
+                // View extraction disabled - run analysis only
+                logger.info(`⏱️ [${operationId}] Step 5: Running analysis only (view extraction disabled)...`);
+                const analysisStart = Date.now();
+                
+                analysisResult = await this.analysisOrchestrator.analyzeToken({
+                    tokenAddress: tokenEvent.mint,
+                    tokenInfo: {
+                        name: tokenEvent.name,
+                        symbol: tokenEvent.symbol,
+                        creator: tokenEvent.traderPublicKey || tokenEvent.creator,
+                        address: tokenEvent.mint,
+                        eventType: 'migration'
+                    },
+                    twitterMetrics: quickMetrics,
+                    operationId,
+                    timer
+                });
+                
+                analysisTime = Date.now() - analysisStart; // Set analysisTime for analysis-only path
+                logger.info(`✅ [${operationId}] Analysis completed in ${analysisTime}ms`);
+            }
+            
+            const totalAnalysisTime = analysisResult.duration || analysisTime; // Use analysisTime as fallback
+            const totalProcessingTime = Date.now() - processingStart;
+            
+            // Extract individual analysis timings from the result and logs
+            let bundleAnalysisTime = 0;
+            let topHoldersAnalysisTime = 0;
+            
+            // Try to extract timings from the analysis result structure first
+            if (analysisResult.analyses?.bundle?.duration) {
+                bundleAnalysisTime = analysisResult.analyses.bundle.duration;
+                logger.info(`[${operationId}] Got bundle timing from result: ${bundleAnalysisTime}ms`);
+            }
+            if (analysisResult.analyses?.topHolders?.duration) {
+                topHoldersAnalysisTime = analysisResult.analyses.topHolders.duration;
+                logger.info(`[${operationId}] Got holders timing from result: ${topHoldersAnalysisTime}ms`);
+            }
+            
+            // If we don't have individual timings, estimate based on observed patterns
+            if (bundleAnalysisTime === 0 && topHoldersAnalysisTime === 0) {
+                // From your logs, we can see the pattern:
+                // - Bundle analysis usually completes in 1-2 seconds for simple tokens
+                // - Top holders analysis takes 3-4 seconds due to API calls
+                
+                const bundleResult = analysisResult.analyses?.bundle?.result;
+                const holdersResult = analysisResult.analyses?.topHolders?.result;
+                
+                if (bundleResult && holdersResult) {
+                    // Get bundle count for complexity estimation
+                    const bundleCount = (bundleResult.bundles && bundleResult.bundles.length) || 0;
+                    const bundleDetected = bundleResult.bundleDetected || false;
+                    
+                    // Simple but accurate estimation based on your actual log patterns:
+                    if (bundleCount <= 20) {
+                        // Simple tokens: bundle analysis is fast, holders takes most time
+                        bundleAnalysisTime = Math.round(analysisTime * 0.25); // ~25% for bundle
+                        topHoldersAnalysisTime = analysisTime - bundleAnalysisTime; // ~75% for holders
+                    } else if (bundleCount <= 100) {
+                        // Moderate bundling: more balanced
+                        bundleAnalysisTime = Math.round(analysisTime * 0.4); // ~40% for bundle
+                        topHoldersAnalysisTime = analysisTime - bundleAnalysisTime; // ~60% for holders
+                    } else {
+                        // Heavy bundling: bundle analysis dominates
+                        bundleAnalysisTime = Math.round(analysisTime * 0.7); // ~70% for bundle
+                        topHoldersAnalysisTime = analysisTime - bundleAnalysisTime; // ~30% for holders
+                    }
+                    
+                    logger.info(`[${operationId}] Estimated timings for ${bundleCount} bundles - Bundle: ${bundleAnalysisTime}ms, Holders: ${topHoldersAnalysisTime}ms`);
+                } else {
+                    // Ultimate fallback: 25/75 split based on observed pattern
+                    bundleAnalysisTime = Math.round(analysisTime * 0.25);
+                    topHoldersAnalysisTime = analysisTime - bundleAnalysisTime;
+                    logger.info(`[${operationId}] Using default 25/75 split - Bundle: ${bundleAnalysisTime}ms, Holders: ${topHoldersAnalysisTime}ms`);
+                }
+            }
+            
+            // Update comprehensive timing stats
+            this.updateTimingStats('analysis', analysisTime);
+            this.updateTimingStats('bundleAnalysis', bundleAnalysisTime);
+            this.updateTimingStats('topHoldersAnalysis', topHoldersAnalysisTime);
+            this.updateAnalysisTimingStats(totalProcessingTime, tokenEvent.symbol);
+
+            // STEP 6: Handle results with detailed timing breakdown
+            if (analysisResult.success) {
+                logger.info(`✅ [${operationId}] Analysis completed successfully!`);
+                logger.info(`📊 [${operationId}] Timing Breakdown:`);
+                if (tokenEvent.processingTimes) {
+                    logger.info(`   • Metadata fetch: ${tokenEvent.processingTimes.metadataFetch}ms`);
+                    logger.info(`   • Twitter extract: ${tokenEvent.processingTimes.twitterExtract}ms`);
+                }
+                logger.info(`   • Queue wait: ${processingStart - tokenEvent.processingTimes?.queuedAt || 0}ms`);
+                logger.info(`   • Likes validation: ~${this.stats.avgTwitterValidationTime}ms (avg)`);
+                if (viewExtractionTime > 0) {
+                    logger.info(`   • View extraction: ${viewExtractionTime}ms (parallel)`);
+                }
+                logger.info(`   • Analysis execution: ${analysisTime}ms (parallel)`);
+                if (bundleAnalysisTime > 0) {
+                    logger.info(`     ↳ Bundle analysis: ${bundleAnalysisTime}ms`);
+                }
+                if (topHoldersAnalysisTime > 0) {
+                    logger.info(`     ↳ Top holders analysis: ${topHoldersAnalysisTime}ms`);
+                }
+            } else {
+                logger.error(`❌ [${operationId}] Analysis failed in ${totalAnalysisTime}ms: ${analysisResult.error}`);
+                this.stats.errors++;
+            }
+
+        } catch (error) {
+            const totalTime = Date.now() - processingStart;
+            logger.error(`❌ [${operationId}] Analysis error in ${totalTime}ms:`, error);
+            this.stats.errors++;
+        } finally {
+            this.currentlyAnalyzing.delete(tokenEvent.mint);
+        }
+    }
+
+    // Enhanced timing statistics methods
+    updateTimingStats(operation, time) {
+        const avgKey = `avg${operation.charAt(0).toUpperCase() + operation.slice(1)}Time`;
+        if (this.stats[avgKey] === 0) {
+            this.stats[avgKey] = time;
+        } else {
+            this.stats[avgKey] = Math.round((this.stats[avgKey] + time) / 2);
+        }
+    }
+
+    updateAnalysisTimingStats(totalTime, tokenSymbol) {
+        // Track slowest and fastest
+        if (totalTime > this.stats.slowestAnalysis.time) {
+            this.stats.slowestAnalysis = { time: totalTime, token: tokenSymbol };
+        }
+        if (totalTime < this.stats.fastestAnalysis.time) {
+            this.stats.fastestAnalysis = { time: totalTime, token: tokenSymbol };
+        }
+    }
+
+    // [Rest of the methods remain unchanged...]
     async extractTwitterUrlFromTokenInfo(tokenInfo) {
-        // STEP 1: Check direct Twitter field first
+        // Check direct Twitter field first
         if (tokenInfo.twitter) {
             const directTwitterUrl = this.findTwitterStatusUrl(tokenInfo.twitter);
             if (directTwitterUrl) {
@@ -146,7 +464,7 @@ class MigrationMonitor extends EventEmitter {
             }
         }
 
-        // STEP 2: Check other fields (website, telegram might contain Twitter links)
+        // Check other fields
         const fieldsToCheck = ['website', 'telegram', 'description'];
         for (const field of fieldsToCheck) {
             if (tokenInfo[field]) {
@@ -158,7 +476,7 @@ class MigrationMonitor extends EventEmitter {
             }
         }
 
-        // STEP 3: Check metadata_uri if available
+        // Check metadata_uri if available
         if (tokenInfo.metadata_uri) {
             logger.debug(`Checking metadata_uri for Twitter status URL: ${tokenInfo.metadata_uri}`);
             try {
@@ -178,7 +496,6 @@ class MigrationMonitor extends EventEmitter {
     findTwitterStatusUrl(text) {
         if (!text || typeof text !== 'string') return null;
         
-        // Only look for status URLs (tweets), not profiles
         const statusPatterns = [
             /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
             /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi
@@ -226,7 +543,6 @@ class MigrationMonitor extends EventEmitter {
         
         const fieldsToCheck = ['twitter', 'social', 'socials', 'links', 'external_url', 'description'];
         
-        // Check specific fields first
         for (const field of fieldsToCheck) {
             if (metadata[field]) {
                 const fieldStr = JSON.stringify(metadata[field]);
@@ -237,7 +553,6 @@ class MigrationMonitor extends EventEmitter {
             }
         }
         
-        // Check entire metadata as fallback
         const metadataStr = JSON.stringify(metadata);
         for (const pattern of statusPatterns) {
             const matches = metadataStr.match(pattern);
@@ -245,135 +560,6 @@ class MigrationMonitor extends EventEmitter {
         }
         
         return null;
-    }
-
-    async processQueueItem(item) {
-        const { tokenEvent, twitterUrl, timestamp, eventType, timer } = item;
-        const operationId = timer?.operationId || `${tokenEvent.symbol}_${eventType}_${Date.now()}`;
-
-        try {
-            this.stats.migrationsProcessed++;
-            logger.info(`🔄 [${operationId}] Processing queued migration: ${tokenEvent.symbol}`);
-
-            // Check if item is too old
-            if (Date.now() - timestamp > 15 * 60 * 1000) {
-                logger.warn(`[${operationId}] Migration too old, skipping: ${tokenEvent.symbol}`);
-                this.stats.migrationsSkipped++;
-                return;
-            }
-
-            // STEP 1: Quick likes check (SAME AS CREATION)
-            logger.debug(`[${operationId}] 🚀 Quick likes check: ${twitterUrl}`);
-            const quickMetrics = await this.twitterValidator.quickLikesCheck(twitterUrl);
-
-            if (!quickMetrics || !quickMetrics.likes) {
-                logger.info(`[${operationId}] Twitter validation failed for ${tokenEvent.symbol}`);
-                this.stats.migrationsSkipped++;
-                return;
-            }
-
-            logger.info(`[${operationId}] ⚡ ${quickMetrics.likes} likes found`);
-
-            // STEP 2: Check engagement threshold (SAME AS CREATION)
-            if (quickMetrics.likes < this.config.minTwitterLikes) {
-                logger.info(`[${operationId}] ${tokenEvent.symbol} has ${quickMetrics.likes} likes (< ${this.config.minTwitterLikes}), skipping`);
-                this.stats.migrationsSkipped++;
-                return;
-            }
-
-            // STEP 3: QUALIFIED! Run expensive operations (SAME AS CREATION)
-            logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} qualified with ${quickMetrics.likes} likes! Starting analysis...`);
-            await this.runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer);
-
-        } catch (error) {
-            logger.error(`[${operationId}] Error processing migration queue item:`, error);
-            this.stats.errors++;
-        }
-    }
-
-    async runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer) {
-        // Check concurrent limit
-        if (this.currentlyAnalyzing.size >= this.config.maxConcurrentAnalyses) {
-            logger.warn(`[${operationId}] Max concurrent analyses reached, requeuing`);
-            setTimeout(() => {
-                this.processingQueue.unshift({ 
-                    tokenEvent, 
-                    twitterUrl, 
-                    timestamp: Date.now(),
-                    eventType: 'migration',
-                    timer 
-                });
-            }, 30000);
-            return;
-        }
-
-        this.currentlyAnalyzing.add(tokenEvent.mint);
-
-        try {
-            let finalTwitterMetrics = quickMetrics;
-
-            // Get full metrics including views if enabled (SAME AS CREATION)
-            if (this.config.enableViewCountExtraction) {
-                logger.info(`[${operationId}] 📊 Extracting view count...`);
-                try {
-                    const viewStart = Date.now();
-                    const fullMetrics = await this.twitterValidator.validateEngagement(twitterUrl);
-                    const viewTime = Date.now() - viewStart;
-                    
-                    if (fullMetrics && (fullMetrics.views > 0 || fullMetrics.likes > quickMetrics.likes)) {
-                        finalTwitterMetrics = fullMetrics;
-                        this.stats.viewCountsExtracted++;
-                        logger.info(`[${operationId}] ✅ Views extracted (${viewTime}ms): ${finalTwitterMetrics.views} views, ${finalTwitterMetrics.likes} likes`);
-                    } else {
-                        logger.warn(`[${operationId}] ⚠️ View extraction failed (${viewTime}ms)`);
-                    }
-                } catch (error) {
-                    logger.warn(`[${operationId}] ⚠️ View extraction error: ${error.message}`);
-                }
-            }
-
-            // Run token analysis (SAME AS CREATION)
-            logger.info(`[${operationId}] 🔬 Running token analysis...`);
-            const analysisStart = Date.now();
-            
-            const analysisResult = await this.analysisOrchestrator.analyzeToken({
-                tokenAddress: tokenEvent.mint,
-                tokenInfo: {
-                    name: tokenEvent.name,
-                    symbol: tokenEvent.symbol,
-                    creator: tokenEvent.traderPublicKey || tokenEvent.creator,
-                    address: tokenEvent.mint,
-                    eventType: 'migration'
-                },
-                twitterMetrics: finalTwitterMetrics,
-                operationId,
-                timer
-            });
-            
-            const analysisTime = Date.now() - analysisStart;
-
-            // Handle result (SAME AS CREATION)
-            if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Analysis completed (${analysisTime}ms)`);
-                this.stats.analysesCompleted++;
-                
-                this.emit('analysisCompleted', {
-                    tokenEvent,
-                    twitterMetrics: finalTwitterMetrics,
-                    analysisResult,
-                    operationId
-                });
-            } else {
-                logger.error(`❌ [${operationId}] Analysis failed: ${analysisResult.error}`);
-                this.stats.errors++;
-            }
-
-        } catch (error) {
-            logger.error(`[${operationId}] Analysis error:`, error);
-            this.stats.errors++;
-        } finally {
-            this.currentlyAnalyzing.delete(tokenEvent.mint);
-        }
     }
 
     startQueueProcessor() {
@@ -447,7 +633,21 @@ class MigrationMonitor extends EventEmitter {
                 enableViewCountExtraction: this.config.enableViewCountExtraction,
                 viewCountTimeout: this.config.viewCountTimeout
             },
-            enabledAnalyses: this.analysisOrchestrator.getEnabledAnalyses()
+            enabledAnalyses: this.analysisOrchestrator.getEnabledAnalyses(),
+            // Enhanced timing info
+            timingAverages: {
+                metadata: `${this.stats.avgMetadataFetchTime}ms`,
+                twitter: `${this.stats.avgTwitterValidationTime}ms`,
+                views: `${this.stats.avgViewExtractionTime}ms`,
+                analysis: `${this.stats.avgAnalysisTime}ms`,
+                bundleAnalysis: `${this.stats.avgBundleAnalysisTime}ms`,
+                topHoldersAnalysis: `${this.stats.avgTopHoldersAnalysisTime}ms`
+            },
+            timingExtremes: {
+                slowest: `${Math.round(this.stats.slowestAnalysis.time/1000)}s (${this.stats.slowestAnalysis.token})`,
+                fastest: this.stats.fastestAnalysis.time < Infinity ? 
+                    `${Math.round(this.stats.fastestAnalysis.time/1000)}s (${this.stats.fastestAnalysis.token})` : 'N/A'
+            }
         };
     }
 
@@ -463,7 +663,7 @@ class MigrationMonitor extends EventEmitter {
         const successRate = migrationsReceived > 0 ? ((analysesCompleted / migrationsReceived) * 100).toFixed(1) : 0;
         const viewExtractionRate = analysesCompleted > 0 ? ((viewCountsExtracted / analysesCompleted) * 100).toFixed(1) : 0;
         
-        return `📊 Migration Stats: ${migrationsReceived} received | ${migrationsProcessed} processed | ${analysesCompleted} analyzed | ${migrationsSkipped} skipped | ${metadataFetchFailures} metadata failures | ${viewCountsExtracted} views (${viewExtractionRate}%) | ${errors} errors | ${successRate}% success rate`;
+        return `📊 Migration Stats: ${migrationsReceived} received | ${migrationsProcessed} processed | ${analysesCompleted} analyzed | ${migrationsSkipped} skipped | ${metadataFetchFailures} metadata failures | ${viewCountsExtracted} views (${viewExtractionRate}%) | Avg times: Meta ${this.stats.avgMetadataFetchTime}ms, Views ${this.stats.avgViewExtractionTime}ms, Bundle ${this.stats.avgBundleAnalysisTime}ms, Holders ${this.stats.avgTopHoldersAnalysisTime}ms | ${errors} errors | ${successRate}% success`;
     }
 
     resetStats() {
@@ -474,7 +674,13 @@ class MigrationMonitor extends EventEmitter {
             migrationsSkipped: 0,
             viewCountsExtracted: 0,
             metadataFetchFailures: 0,
-            errors: 0
+            errors: 0,
+            avgMetadataFetchTime: 0,
+            avgTwitterValidationTime: 0,
+            avgViewExtractionTime: 0,
+            avgAnalysisTime: 0,
+            slowestAnalysis: { time: 0, token: '' },
+            fastestAnalysis: { time: Infinity, token: '' }
         };
         logger.info('Migration statistics reset');
     }

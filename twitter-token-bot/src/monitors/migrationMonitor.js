@@ -252,12 +252,12 @@ class MigrationMonitor extends EventEmitter {
                 const analysisStart = Date.now();
                 
                 try {
-                    // Run both operations in parallel
+                    // Run both operations in parallel - but get VIEWS ONLY from puppeteer
                     const [viewMetrics, analysisRes] = await Promise.all([
-                        // View extraction with puppeteer
-                        this.twitterValidator.validateEngagement(twitterUrl),
+                        // FIXED: Get only views from puppeteer
+                        this.twitterValidator.getViewsFromPage(this.twitterValidator.extractTweetId(twitterUrl)),
                         
-                        // Analysis using quick metrics (will update with views if successful)
+                        // Analysis using quick metrics 
                         this.analysisOrchestrator.analyzeToken({
                             tokenAddress: tokenEvent.mint,
                             tokenInfo: {
@@ -267,23 +267,32 @@ class MigrationMonitor extends EventEmitter {
                                 address: tokenEvent.mint,
                                 eventType: 'migration'
                             },
-                            twitterMetrics: quickMetrics, // Start with quick metrics
+                            twitterMetrics: quickMetrics, // Use the working likes from quickMetrics
                             operationId,
                             timer
                         })
                     ]);
                     
                     viewExtractionTime = Date.now() - viewStart;
-                    analysisTime = Date.now() - analysisStart; // Set analysisTime here
+                    analysisTime = Date.now() - analysisStart;
                     analysisResult = analysisRes;
                     
-                    // Update final metrics if view extraction was successful
-                    if (viewMetrics && (viewMetrics.views > 0 || viewMetrics.likes > quickMetrics.likes)) {
-                        finalTwitterMetrics = viewMetrics;
+                    if (viewMetrics && viewMetrics.views > 0) {
+                        // Combine views from puppeteer + likes from quickMetrics
+                        finalTwitterMetrics = {
+                            link: twitterUrl,
+                            views: viewMetrics.views,
+                            likes: quickMetrics.likes,
+                            retweets: 0,
+                            replies: 0,
+                            publishedAt: quickMetrics.publishedAt
+                        };
                         this.stats.viewCountsExtracted++;
-                        logger.info(`✅ [${operationId}] Parallel execution completed - Views: ${viewMetrics.views}, Analysis: ${analysisTime}ms (saved ~${Math.abs(viewExtractionTime - analysisTime)}ms)`);
+                        logger.info(`✅ [${operationId}] Parallel execution completed - Views: ${viewMetrics.views}, Analysis: ${analysisTime}ms`);
                     } else {
-                        logger.warn(`⚠️ [${operationId}] Parallel execution completed - View extraction failed but analysis succeeded in ${analysisTime}ms`);
+                        // Views failed, use quickMetrics
+                        finalTwitterMetrics = quickMetrics;
+                        logger.warn(`⚠️ [${operationId}] View extraction failed, using likes only: ${quickMetrics.likes}`);
                     }
                     
                     this.updateTimingStats('viewExtraction', viewExtractionTime);
@@ -310,7 +319,8 @@ class MigrationMonitor extends EventEmitter {
                         timer
                     });
                     
-                    analysisTime = Date.now() - fallbackAnalysisStart; // Set analysisTime for fallback
+                    analysisTime = Date.now() - fallbackAnalysisStart;
+                    finalTwitterMetrics = quickMetrics; // Use quickMetrics as fallback
                     logger.info(`✅ [${operationId}] Fallback analysis completed in ${analysisTime}ms`);
                     
                     this.updateTimingStats('viewExtraction', viewExtractionTime);

@@ -1,4 +1,4 @@
-// Cleaned TwitterValidator - Only fast likes + puppeteer views
+// Cleaned TwitterValidator - Only fast likes + puppeteer views with SIMPLE views detection
 const axios = require('axios');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -166,23 +166,27 @@ class TwitterValidator {
         if (!tweetId) return null;
 
         try {
-            // Get views from puppeteer if enabled
+            // Get likes first (this already works)
+            const quickMetrics = await this.quickLikesCheck(twitterUrl);
+            
+            // Get views if enabled
             if (this.config.enablePageExtraction) {
                 const pageMetrics = await this.getViewsFromPage(tweetId);
-                if (pageMetrics) {
+                if (pageMetrics && pageMetrics.views > 0) {
+                    // Combine: views from page + likes from quickMetrics
                     return {
                         link: twitterUrl,
-                        views: pageMetrics.views || 0,
-                        likes: pageMetrics.likes || 0,
+                        views: pageMetrics.views,
+                        likes: quickMetrics?.likes || 0,
                         retweets: 0,
                         replies: 0,
-                        publishedAt: null
+                        publishedAt: quickMetrics?.publishedAt || null
                     };
                 }
             }
 
             // Fallback to just likes
-            return await this.quickLikesCheck(twitterUrl) || {
+            return quickMetrics || {
                 link: twitterUrl,
                 views: 0,
                 likes: 0,
@@ -205,7 +209,7 @@ class TwitterValidator {
     }
 
     /**
-     * Get views from page using puppeteer - targets exact CSS class
+     * Get views from page - EXACTLY like your test script
      */
     async getViewsFromPage(tweetId) {
         if (!this.browser) {
@@ -223,35 +227,30 @@ class TwitterValidator {
                 timeout: 30000 
             });
 
-            await page.waitForTimeout(3000);
+            await new Promise(resolve => setTimeout(resolve, 3000));
 
-            // Get all spans with the exact CSS class for metrics
-            const metrics = await page.evaluate(() => {
+            // Find the exact span that contains "Views"
+            const views = await page.evaluate(() => {
                 const spans = document.querySelectorAll('span.css-1jxf684.r-bcqeeo.r-1ttztb7.r-qvutc0.r-poiln3');
-                const numbers = [];
                 
-                spans.forEach(span => {
+                for (const span of spans) {
                     const text = span.textContent.trim();
-                    if (/^\d+(\.\d+)?[KMB]?$/.test(text)) {
-                        numbers.push(text);
+                    if (text.includes('Views')) {
+                        return text;
                     }
-                });
+                }
                 
-                return numbers;
+                return null;
             });
 
-            const parsedNumbers = metrics.map(num => this.parseNumber(num)).filter(n => n > 0);
-            
-            if (parsedNumbers.length > 0) {
-                // Views are typically the largest number
-                const views = Math.max(...parsedNumbers);
-                // Likes are typically smaller
-                const likes = parsedNumbers.find(n => n < views && n > 0) || 0;
-                
-                return { views, likes };
+            if (!views) {
+                return null;
             }
 
-            return null;
+            // Parse the views number
+            const viewCount = this.parseNumber(views);
+            
+            return { views: viewCount, likes: 0 };
 
         } catch (error) {
             logger.debug(`Page scraping failed for ${tweetId}: ${error.message}`);
@@ -261,20 +260,17 @@ class TwitterValidator {
         }
     }
 
+    /**
+     * Parse number from text like "6,146 Views"
+     */
     parseNumber(str) {
-        if (!str) return 0;
+        if (!str || typeof str !== 'string') return 0;
         
-        const clean = str.replace(/,/g, '').trim();
+        // Remove everything except digits and commas
+        const number = str.replace(/[^\d,]/g, '');
         
-        if (clean.includes('K') || clean.includes('k')) {
-            return Math.round(parseFloat(clean) * 1000);
-        } else if (clean.includes('M') || clean.includes('m')) {
-            return Math.round(parseFloat(clean) * 1000000);
-        } else if (clean.includes('B') || clean.includes('b')) {
-            return Math.round(parseFloat(clean) * 1000000000);
-        }
-        
-        return parseInt(clean) || 0;
+        // Remove commas and parse
+        return parseInt(number.replace(/,/g, '')) || 0;
     }
 
     extractTweetId(url) {

@@ -164,13 +164,22 @@ class PumpFunUnifiedApp {
         this.wsManager.on('connected', () => {
             logger.info('✅ WebSocket connected successfully');
             
-            // Subscribe based on bot mode
+            // 🚀 FIXED: Explicitly set what we want to subscribe to
             if (this.shouldRunCreation()) {
+                logger.info('🆕 Setting up NEW TOKEN subscription...');
                 this.wsManager.subscribeNewToken();
             }
+            
             if (this.shouldRunMigration()) {
+                logger.info('🔄 Setting up MIGRATION subscription...');
                 this.wsManager.subscribeMigration();
             }
+            
+            // 🚀 ADDED: Log subscription status after setup
+            setTimeout(() => {
+                const status = this.wsManager.getSubscriptionStatus();
+                logger.info('📊 Subscription Status:', JSON.stringify(status, null, 2));
+            }, 3000);
         });
 
         this.wsManager.on('disconnected', ({ code, reason }) => {
@@ -181,9 +190,12 @@ class PumpFunUnifiedApp {
         // Setup event handlers based on mode
         if (this.shouldRunCreation()) {
             this.wsManager.on('newToken', this.handleNewToken);
+            logger.info('🆕 Registered newToken event handler');
         }
+        
         if (this.shouldRunMigration()) {
             this.wsManager.on('tokenMigration', this.handleTokenMigration);
+            logger.info('🔄 Registered tokenMigration event handler');
         }
         
         this.wsManager.on('error', this.handleError);
@@ -195,8 +207,34 @@ class PumpFunUnifiedApp {
 
         // Connect to WebSocket
         await this.wsManager.connect();
+        
+        // 🚀 ADDED: Set up periodic subscription verification
+        this.setupSubscriptionMonitoring();
     }
 
+
+    setupSubscriptionMonitoring() {
+        setInterval(() => {
+            if (this.wsManager && this.wsManager.isConnected) {
+                const stats = this.wsManager.getStatsString();
+                logger.debug(stats);
+                
+                const status = this.wsManager.getSubscriptionStatus();
+                
+                // Check for subscription issues
+                if (this.shouldRunMigration() && !status.subscriptions.migration.working) {
+                    logger.warn('⚠️ Migration subscription not working, attempting resubscribe...');
+                    this.wsManager.subscribeMigration();
+                }
+                
+                if (this.shouldRunCreation() && !status.subscriptions.newToken.working) {
+                    logger.warn('⚠️ New token subscription not working, attempting resubscribe...');
+                    this.wsManager.subscribeNewToken();
+                }
+            }
+        }, 60000); // Check every minute
+    }
+    
     async initializeMonitors() {
         logger.info('📊 Initializing monitors...');
         

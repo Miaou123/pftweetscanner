@@ -1,4 +1,4 @@
-// src/services/websocketManager.js - Enhanced with comprehensive migration logging
+// src/services/websocketManager.js - Fixed to not require migration confirmation
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
@@ -15,28 +15,23 @@ class WebSocketManager extends EventEmitter {
         this.reconnectDelay = config.reconnectDelay || 5000;
         this.connectionId = Math.random().toString(36).substring(7);
         
-        // Track subscriptions to respect bot mode
-        this.subscriptions = {
+        // Track what we should be subscribed to
+        this.subscriptionState = {
             newToken: false,
-            migration: false
+            migration: false, // Will be set to true after sending request (no confirmation expected)
+            targetSubscriptions: {
+                newToken: false,
+                migration: false
+            }
         };
         
         this.messageStats = {
             received: 0,
             processed: 0,
             errors: 0,
-            migrations: 0,  // 🔥 NEW: Track migration count
-            newTokens: 0,   // 🔥 NEW: Track new token count
-            other: 0        // 🔥 NEW: Track other message types
-        };
-
-        // 🔥 NEW: Migration debugging stats
-        this.migrationStats = {
-            total: 0,
-            withMint: 0,
-            withSignature: 0,
-            processed: 0,
-            errors: 0
+            migrations: 0,
+            creations: 0,
+            unknownTypes: 0
         };
     }
 
@@ -51,10 +46,19 @@ class WebSocketManager extends EventEmitter {
         this.ws = new WebSocket(this.url);
         
         this.ws.on('open', () => {
-            logger.info(`[${this.connectionId}] Connected successfully`);
+            logger.info(`[${this.connectionId}] ✅ Connected successfully`);
             this.isConnected = true;
             this.reconnectAttempts = 0;
-            this.resubscribeAll();
+            
+            // Reset subscription state
+            this.subscriptionState.newToken = false;
+            this.subscriptionState.migration = false;
+            
+            // Resubscribe after a small delay to ensure connection is stable
+            setTimeout(() => {
+                this.resubscribeAll();
+            }, 1000);
+            
             this.emit('connected');
         });
 
@@ -64,102 +68,35 @@ class WebSocketManager extends EventEmitter {
             try {
                 const message = JSON.parse(data.toString());
                 
-                // Skip subscription confirmations
+                // Handle subscription confirmations (only for new tokens)
                 if (message.message && message.message.includes('Successfully subscribed')) {
                     logger.info(`[${this.connectionId}] ✅ ${message.message}`);
+                    
+                    // Update subscription state based on confirmation
+                    if (message.message.includes('new token')) {
+                        this.subscriptionState.newToken = true;
+                    }
+                    // Note: Migration subscriptions don't seem to send confirmations
                     return;
                 }
                 
-                // 🔥 LOG ALL MESSAGES FIRST (for debugging)
-                this.logRawMessage(message);
-                
-                // Process new tokens
-                if (message.txType === 'create' && this.subscriptions.newToken) {
-                    this.messageStats.newTokens++;
-                    logger.info(`[${this.connectionId}] 🪙 NEW TOKEN: ${message.name} (${message.symbol}) - ${message.mint}`);
-                    
-                    const tokenEvent = {
-                        eventType: 'creation',
-                        mint: message.mint,
-                        name: message.name,
-                        symbol: message.symbol,
-                        creator: message.traderPublicKey,
-                        signature: message.signature,
-                        timestamp: Date.now(),
-                        operationId: `${message.symbol}_creation_${Date.now()}`,
-                        timer: createTimer(`${message.symbol}_creation_${Date.now()}`)
-                    };
-                    
-                    this.messageStats.processed++;
-                    this.emit('newToken', tokenEvent);
+                // 🚀 ENHANCED: Migration detection with multiple patterns
+                if (this.isMigrationMessage(message)) {
+                    this.handleMigrationMessage(message);
                 }
-                // 🔥 ENHANCED MIGRATION PROCESSING
-                else if (message.txType === 'migration' && this.subscriptions.migration) {
-                    this.messageStats.migrations++;
-                    this.migrationStats.total++;
-                    
-                    // 🔥 ALWAYS LOG MIGRATION DATA (even if processing fails)
-                    logger.info(`[${this.connectionId}] 🔄 MIGRATION DETECTED:`);
-                    logger.info(`   • Raw Data: ${JSON.stringify(message, null, 2)}`);
-                    
-                    // Validate migration data
-                    if (message.mint) {
-                        this.migrationStats.withMint++;
-                        logger.info(`   • Mint: ${message.mint}`);
-                    } else {
-                        logger.warn(`   • ⚠️ Missing mint field!`);
-                    }
-                    
-                    if (message.signature) {
-                        this.migrationStats.withSignature++;
-                        logger.info(`   • Signature: ${message.signature}`);
-                    } else {
-                        logger.warn(`   • ⚠️ Missing signature field!`);
-                    }
-                    
-                    // Log all available fields
-                    const fields = Object.keys(message);
-                    logger.info(`   • Available fields: ${fields.join(', ')}`);
-                    
-                    try {
-                        const migrationEvent = {
-                            eventType: 'migration',
-                            mint: message.mint,
-                            signature: message.signature,
-                            timestamp: Date.now(),
-                            operationId: `${message.mint || 'unknown'}_migration_${Date.now()}`,
-                            timer: createTimer(`${message.mint || 'unknown'}_migration_${Date.now()}`),
-                            rawData: message // Include full raw data
-                        };
-                        
-                        this.migrationStats.processed++;
-                        this.messageStats.processed++;
-                        
-                        logger.info(`[${this.connectionId}] ✅ Migration event created for ${message.mint}`);
-                        this.emit('tokenMigration', migrationEvent);
-                        
-                    } catch (migrationError) {
-                        this.migrationStats.errors++;
-                        logger.error(`[${this.connectionId}] ❌ Error creating migration event:`, migrationError);
-                        logger.error(`   • Message that caused error: ${JSON.stringify(message, null, 2)}`);
-                    }
+                // Token creation
+                else if (message.txType === 'create') {
+                    this.handleCreationMessage(message);
                 }
-                // Log ignored messages for debugging
-                else if (message.txType === 'create' && !this.subscriptions.newToken) {
-                    logger.debug(`[${this.connectionId}] 🚫 IGNORED NEW TOKEN (not subscribed): ${message.name || 'Unknown'}`);
-                }
-                else if (message.txType === 'migration' && !this.subscriptions.migration) {
-                    logger.debug(`[${this.connectionId}] 🚫 IGNORED MIGRATION (not subscribed): ${message.mint || 'Unknown'}`);
-                }
+                // Unknown message types - log for debugging
                 else {
-                    this.messageStats.other++;
-                    logger.debug(`[${this.connectionId}] OTHER: ${message.txType || 'NO_TYPE'} | Keys: ${Object.keys(message).join(', ')}`);
+                    this.handleUnknownMessage(message);
                 }
                 
             } catch (error) {
                 this.messageStats.errors++;
-                logger.error(`[${this.connectionId}] Parse error:`, error);
-                logger.error(`[${this.connectionId}] Raw message that failed: ${data.toString()}`);
+                logger.error(`[${this.connectionId}] ❌ Message parse error:`, error);
+                logger.debug(`[${this.connectionId}] Raw message: ${data.toString().substring(0, 200)}...`);
             }
         });
 
@@ -171,6 +108,11 @@ class WebSocketManager extends EventEmitter {
         this.ws.on('close', (code, reason) => {
             logger.warn(`[${this.connectionId}] Closed: ${code} - ${reason}`);
             this.isConnected = false;
+            
+            // Reset subscription state on disconnect
+            this.subscriptionState.newToken = false;
+            this.subscriptionState.migration = false;
+            
             this.emit('disconnected', { code, reason });
             
             if (code !== 1000) {
@@ -179,19 +121,101 @@ class WebSocketManager extends EventEmitter {
         });
     }
 
-    // 🔥 NEW: Log raw messages for debugging
-    logRawMessage(message) {
-        const txType = message.txType || 'UNKNOWN';
-        const fields = Object.keys(message);
+    // 🚀 FIXED: Migration detection based on actual PumpPortal data
+    isMigrationMessage(message) {
+        // 🔥 ACTUAL PATTERN: txType === "migrate" (not "migration")
+        if (message.txType === 'migrate') {
+            return true;
+        }
         
-        // Log every 100th message to avoid spam, but always log migrations
-        if (txType === 'migration' || this.messageStats.received % 100 === 0) {
-            logger.debug(`[${this.connectionId}] RAW MESSAGE #${this.messageStats.received}:`);
-            logger.debug(`   • Type: ${txType}`);
-            logger.debug(`   • Fields: ${fields.join(', ')}`);
+        // Standard migration pattern (keep as fallback)
+        if (message.txType === 'migration') {
+            return true;
+        }
+        
+        // Alternative patterns that might indicate migration
+        if (message.type === 'migration' || message.type === 'migrate') {
+            return true;
+        }
+        
+        // Check for other potential migration indicators
+        if (message.action === 'migrate' || message.event === 'migration') {
+            return true;
+        }
+        
+        // Look for pump-amm pool migrations specifically
+        if (message.mint && message.signature && message.pool === 'pump-amm') {
+            return true;
+        }
+        
+        return false;
+    }
+
+    handleMigrationMessage(message) {
+        this.messageStats.migrations++;
+        this.messageStats.processed++;
+        
+        logger.info(`[${this.connectionId}] 🔄 MIGRATION DETECTED!`);
+        logger.info(`[${this.connectionId}] Migration data:`, {
+            txType: message.txType,
+            mint: message.mint,
+            signature: message.signature,
+            pool: message.pool,
+            keys: Object.keys(message)
+        });
+        
+        const migrationEvent = {
+            eventType: 'migration',
+            mint: message.mint,
+            signature: message.signature,
+            pool: message.pool, // Add pool info
+            timestamp: Date.now(),
+            operationId: `${message.mint}_migration_${Date.now()}`,
+            timer: createTimer(`${message.mint}_migration_${Date.now()}`),
+            rawData: message
+        };
+        
+        this.emit('tokenMigration', migrationEvent);
+    }
+
+    handleCreationMessage(message) {
+        this.messageStats.creations++;
+        this.messageStats.processed++;
+        
+        logger.info(`[${this.connectionId}] 🪙 NEW TOKEN: ${message.name} (${message.symbol}) - ${message.mint}`);
+        
+        const tokenEvent = {
+            eventType: 'creation',
+            mint: message.mint,
+            name: message.name,
+            symbol: message.symbol,
+            creator: message.traderPublicKey,
+            signature: message.signature,
+            timestamp: Date.now(),
+            operationId: `${message.symbol}_creation_${Date.now()}`,
+            timer: createTimer(`${message.symbol}_creation_${Date.now()}`)
+        };
+        
+        this.emit('newToken', tokenEvent);
+    }
+
+    handleUnknownMessage(message) {
+        this.messageStats.unknownTypes++;
+        
+        // Log unknown message types for debugging (but skip migrations since we handle them now)
+        if (message.txType !== 'migrate' && message.txType !== 'migration') {
+            logger.debug(`[${this.connectionId}] UNKNOWN MESSAGE TYPE: ${message.txType || message.type || 'NO_TYPE'}`);
+            logger.debug(`[${this.connectionId}] Message keys: ${Object.keys(message).join(', ')}`);
             
-            if (txType === 'migration') {
-                logger.debug(`   • Full Data: ${JSON.stringify(message, null, 2)}`);
+            // Check if this might be a new pattern we should handle
+            if (message.mint && (message.signature || message.sig)) {
+                logger.warn(`[${this.connectionId}] ⚠️ Unknown transaction with mint/signature:`, {
+                    txType: message.txType || message.type,
+                    mint: message.mint,
+                    signature: message.signature || message.sig,
+                    allKeys: Object.keys(message),
+                    sample: JSON.stringify(message, null, 2).substring(0, 300) + '...'
+                });
             }
         }
     }
@@ -221,96 +245,119 @@ class WebSocketManager extends EventEmitter {
             return false;
         }
 
-        this.ws.send(JSON.stringify(payload));
-        return true;
+        try {
+            this.ws.send(JSON.stringify(payload));
+            logger.debug(`[${this.connectionId}] Sent: ${JSON.stringify(payload)}`);
+            return true;
+        } catch (error) {
+            logger.error(`[${this.connectionId}] Send error:`, error);
+            return false;
+        }
     }
 
     subscribeNewToken() {
+        this.subscriptionState.targetSubscriptions.newToken = true;
+        
         if (this.send({ method: 'subscribeNewToken' })) {
-            this.subscriptions.newToken = true;
-            logger.info(`[${this.connectionId}] ✅ Subscribed to new tokens`);
+            logger.info(`[${this.connectionId}] 📤 Sent new token subscription request`);
             return true;
         }
         return false;
     }
 
     subscribeMigration() {
+        this.subscriptionState.targetSubscriptions.migration = true;
+        
         if (this.send({ method: 'subscribeMigration' })) {
-            this.subscriptions.migration = true;
-            logger.info(`[${this.connectionId}] ✅ Subscribed to migrations`);
+            logger.info(`[${this.connectionId}] 📤 Sent migration subscription request`);
+            // 🚀 FIXED: Assume migration subscription works (no confirmation expected)
+            this.subscriptionState.migration = true;
+            logger.info(`[${this.connectionId}] ✅ Assuming migration subscription is active (no confirmation expected)`);
             return true;
         }
         return false;
     }
 
+    // 🚀 FIXED: Updated resubscription logic
     resubscribeAll() {
-        if (this.subscriptions.newToken) {
+        const subscriptions = [];
+        
+        if (this.subscriptionState.targetSubscriptions.newToken) {
+            subscriptions.push('new tokens');
             setTimeout(() => this.subscribeNewToken(), 100);
         }
-        if (this.subscriptions.migration) {
+        
+        if (this.subscriptionState.targetSubscriptions.migration) {
+            subscriptions.push('migrations');
             setTimeout(() => this.subscribeMigration(), 200);
         }
         
-        // Log what we're resubscribing to
-        const subs = [];
-        if (this.subscriptions.newToken) subs.push('newToken');
-        if (this.subscriptions.migration) subs.push('migration');
-        logger.info(`[${this.connectionId}] 🔄 Resubscribing to: ${subs.join(', ') || 'nothing'}`);
+        if (subscriptions.length > 0) {
+            logger.info(`[${this.connectionId}] 🔄 Resubscribing to: ${subscriptions.join(', ')}`);
+        } else {
+            logger.warn(`[${this.connectionId}] 🔄 No target subscriptions set - nothing to resubscribe to`);
+        }
     }
 
-    // 🔥 ENHANCED: Get detailed connection info including migration stats
+    // 🚀 UPDATED: Simplified subscription verification (migration assumed working)
+    verifySubscriptions() {
+        const issues = [];
+        
+        if (this.subscriptionState.targetSubscriptions.newToken && !this.subscriptionState.newToken) {
+            issues.push('new tokens');
+        }
+        
+        // Don't verify migration subscription since no confirmation is expected
+        
+        if (issues.length > 0) {
+            logger.warn(`[${this.connectionId}] ⚠️ Subscription verification failed for: ${issues.join(', ')}`);
+            logger.warn(`[${this.connectionId}] Attempting to resubscribe...`);
+            
+            // Retry subscriptions
+            setTimeout(() => {
+                this.resubscribeAll();
+            }, 2000);
+        } else {
+            logger.info(`[${this.connectionId}] ✅ All subscriptions verified successfully`);
+        }
+    }
+
+    // 🚀 UPDATED: Get subscription status
+    getSubscriptionStatus() {
+        return {
+            connected: this.isConnected,
+            subscriptions: {
+                newToken: {
+                    target: this.subscriptionState.targetSubscriptions.newToken,
+                    actual: this.subscriptionState.newToken,
+                    working: this.subscriptionState.targetSubscriptions.newToken === this.subscriptionState.newToken
+                },
+                migration: {
+                    target: this.subscriptionState.targetSubscriptions.migration,
+                    actual: this.subscriptionState.migration,
+                    working: this.subscriptionState.targetSubscriptions.migration === this.subscriptionState.migration,
+                    note: "Migration subscription assumed working (no confirmation expected)"
+                }
+            }
+        };
+    }
+
     getConnectionInfo() {
         return {
             connectionId: this.connectionId,
             isConnected: this.isConnected,
             reconnectAttempts: this.reconnectAttempts,
             messageStats: this.messageStats,
-            subscriptions: this.subscriptions,
-            migrationStats: this.migrationStats, // 🔥 NEW: Migration debugging info
-            detailedStats: {
-                totalMessages: this.messageStats.received,
-                newTokens: this.messageStats.newTokens,
-                migrations: this.messageStats.migrations,
-                other: this.messageStats.other,
-                errors: this.messageStats.errors,
-                processed: this.messageStats.processed
-            }
+            subscriptionStatus: this.getSubscriptionStatus()
         };
     }
 
-    // 🔥 NEW: Get migration statistics
-    getMigrationStats() {
-        return {
-            ...this.migrationStats,
-            successRate: this.migrationStats.total > 0 ? 
-                ((this.migrationStats.processed / this.migrationStats.total) * 100).toFixed(1) + '%' : '0%',
-            dataQuality: {
-                withMint: this.migrationStats.withMint,
-                withSignature: this.migrationStats.withSignature,
-                completeness: this.migrationStats.total > 0 ? 
-                    ((this.migrationStats.withMint / this.migrationStats.total) * 100).toFixed(1) + '%' : '0%'
-            }
-        };
-    }
-
-    // 🔥 NEW: Log comprehensive stats periodically
-    logStats() {
-        logger.info(`[${this.connectionId}] 📊 WebSocket Stats:`);
-        logger.info(`   • Total Messages: ${this.messageStats.received}`);
-        logger.info(`   • New Tokens: ${this.messageStats.newTokens}`);
-        logger.info(`   • Migrations: ${this.messageStats.migrations}`);
-        logger.info(`   • Other: ${this.messageStats.other}`);
-        logger.info(`   • Errors: ${this.messageStats.errors}`);
-        logger.info(`   • Processed: ${this.messageStats.processed}`);
+    // 🚀 UPDATED: Get detailed stats string
+    getStatsString() {
+        const { received, processed, errors, migrations, creations, unknownTypes } = this.messageStats;
+        const subscriptionStatus = this.getSubscriptionStatus();
         
-        if (this.migrationStats.total > 0) {
-            logger.info(`[${this.connectionId}] 🔄 Migration Stats:`);
-            logger.info(`   • Total Detected: ${this.migrationStats.total}`);
-            logger.info(`   • With Mint: ${this.migrationStats.withMint}/${this.migrationStats.total}`);
-            logger.info(`   • With Signature: ${this.migrationStats.withSignature}/${this.migrationStats.total}`);
-            logger.info(`   • Successfully Processed: ${this.migrationStats.processed}/${this.migrationStats.total}`);
-            logger.info(`   • Errors: ${this.migrationStats.errors}`);
-        }
+        return `📡 WebSocket Stats: ${received} received | ${processed} processed | ${creations} creations | ${migrations} migrations | ${unknownTypes} unknown | ${errors} errors | Subscriptions: newToken=${subscriptionStatus.subscriptions.newToken.working ? '✅' : '❌'} migration=${subscriptionStatus.subscriptions.migration.working ? '✅' : '🔶'}`;
     }
 
     disconnect() {
@@ -319,11 +366,10 @@ class WebSocketManager extends EventEmitter {
             this.ws = null;
         }
         this.isConnected = false;
-        // Reset subscriptions
-        this.subscriptions = {
-            newToken: false,
-            migration: false
-        };
+        
+        // Reset subscription state
+        this.subscriptionState.newToken = false;
+        this.subscriptionState.migration = false;
     }
 }
 

@@ -1,5 +1,6 @@
-// Updated AnalysisOrchestrator with simplified config
+// Updated AnalysisOrchestrator with ULTRA-FAST webhook integration
 const path = require('path');
+const axios = require('axios');
 const logger = require('../utils/logger');
 const BundleAnalyzer = require('../analysis/bundleAnalyzer');
 const TopHoldersAnalyzer = require('../analysis/topHoldersAnalyzer');
@@ -24,8 +25,26 @@ class AnalysisOrchestrator {
         this.config.enabledAnalyses = botSpecificConfig.enabledAnalyses;
         this.config.maxConcurrentAnalyses = botSpecificConfig.maxConcurrent;
 
+        // 🚀 WEBHOOK CONFIGURATION - Ultra-fast trading bot integration
+        this.webhookConfig = {
+            enabled: process.env.ENABLE_TRADING_WEBHOOK === 'true',
+            url: process.env.TRADING_BOT_WEBHOOK_URL || 'http://localhost:3001/webhook/alert',
+            apiKey: process.env.TRADING_BOT_API_KEY || 'your-secret-key',
+            timeout: parseInt(process.env.WEBHOOK_TIMEOUT) || 3000, // 3 second timeout
+            retries: parseInt(process.env.WEBHOOK_RETRIES) || 1, // Quick retry
+            fallbackToTelegram: process.env.WEBHOOK_FALLBACK !== 'false'
+        };
+
         logger.info(`🔬 AnalysisOrchestrator initialized for ${this.botType} bot`);
         logger.info(`📋 Enabled analyses: ${this.config.enabledAnalyses.join(', ')}`);
+        
+        // 🚀 Log webhook status
+        if (this.webhookConfig.enabled) {
+            logger.info(`⚡ FAST WEBHOOK ENABLED: ${this.webhookConfig.url}`);
+            logger.info(`🎯 Trading bot will receive alerts in ~5-20ms!`);
+        } else {
+            logger.info(`📱 Using Telegram-only integration (slower)`);
+        }
 
         this.bundleAnalyzer = BundleAnalyzer;
         this.topHoldersAnalyzer = new TopHoldersAnalyzer();
@@ -40,6 +59,17 @@ class AnalysisOrchestrator {
         // Analysis state
         this.activeAnalyses = new Map();
         this.completedAnalyses = new Map();
+        
+        // Webhook statistics
+        this.webhookStats = {
+            alertsSent: 0,
+            alertsSuccessful: 0,
+            alertsFailed: 0,
+            averageLatency: 0,
+            totalLatency: 0,
+            fastestAlert: Infinity,
+            slowestAlert: 0
+        };
     }
 
     async analyzeToken(tokenData) {
@@ -144,9 +174,9 @@ class AnalysisOrchestrator {
                 await this.saveToJsonLog(analysisResult);
             }
 
-            // Publish results to Telegram
+            // 🚀 PUBLISH RESULTS WITH WEBHOOK-FIRST STRATEGY
             if (this.config.publishResults) {
-                await this.publishResults(analysisResult);
+                await this.publishResultsWithWebhook(analysisResult);
             }
 
             if (analysisResult.success) {
@@ -177,6 +207,322 @@ class AnalysisOrchestrator {
             // Clean up old completed analyses
             this.cleanupCompletedAnalyses();
         }
+    }
+
+    // 🚀 NEW: Webhook-first publishing strategy for ultra-fast trading
+    async publishResultsWithWebhook(analysisResult) {
+        const { operationId } = analysisResult;
+        const publishStart = Date.now();
+        
+        try {
+            // STEP 1: 🚀 SEND WEBHOOK FIRST (5-20ms) - Critical for trading speed
+            let webhookSuccess = false;
+            if (this.webhookConfig.enabled) {
+                webhookSuccess = await this.sendWebhookAlert(analysisResult);
+            }
+            
+            // STEP 2: 📱 SEND TELEGRAM (500-2000ms) - Backup/monitoring
+            const telegramPromise = this.telegramPublisher.publishAnalysis(analysisResult);
+            
+            // Don't wait for Telegram if webhook succeeded and we want speed
+            if (webhookSuccess && !this.webhookConfig.fallbackToTelegram) {
+                // Fire and forget Telegram for monitoring
+                telegramPromise.catch(error => {
+                    logger.warn(`[${operationId}] Telegram backup failed:`, error.message);
+                });
+                
+                const totalTime = Date.now() - publishStart;
+                logger.info(`⚡ [${operationId}] Fast webhook-only publish completed in ${totalTime}ms`);
+            } else {
+                // Wait for Telegram as backup or primary
+                try {
+                    await telegramPromise;
+                    const totalTime = Date.now() - publishStart;
+                    logger.info(`📤 [${operationId}] Full publish completed in ${totalTime}ms`);
+                } catch (telegramError) {
+                    logger.error(`[${operationId}] Telegram publish failed:`, telegramError.message);
+                    if (!webhookSuccess) {
+                        throw new Error('Both webhook and Telegram publishing failed');
+                    }
+                }
+            }
+            
+        } catch (error) {
+            logger.error(`❌ [${operationId}] Publishing failed:`, error);
+            throw error;
+        }
+    }
+
+    // 🚀 NEW: Ultra-fast webhook alert sender
+    async sendWebhookAlert(analysisResult) {
+        if (!this.webhookConfig.enabled) {
+            return false;
+        }
+
+        const { operationId, timer } = analysisResult;
+        const webhookStart = Date.now();
+        
+        try {
+            // Format alert for trading bot
+            const alert = this.formatWebhookAlert(analysisResult);
+            
+            // Calculate processing time for trading bot decision making
+            const processingTime = timer ? timer.getElapsedMs() : 0;
+            
+            // Enhanced alert with timing data
+            const enhancedAlert = {
+                ...alert,
+                metadata: {
+                    processingTime,
+                    webhookSentAt: Date.now(),
+                    analysisDuration: analysisResult.duration,
+                    botType: this.botType,
+                    priority: this.calculateAlertPriority(alert)
+                }
+            };
+            
+            // Send webhook with timeout and retry
+            const response = await this.sendWebhookRequest(enhancedAlert, this.webhookConfig.retries);
+            
+            const webhookTime = Date.now() - webhookStart;
+            
+            // Update webhook statistics
+            this.updateWebhookStats(webhookTime, true);
+            
+            logger.info(`⚡ [${operationId}] WEBHOOK SUCCESS: Trading bot notified in ${webhookTime}ms`);
+            logger.info(`🎯 [${operationId}] Alert priority: ${enhancedAlert.metadata.priority} | Total processing: ${processingTime}ms`);
+            
+            return true;
+            
+        } catch (error) {
+            const webhookTime = Date.now() - webhookStart;
+            this.updateWebhookStats(webhookTime, false);
+            
+            logger.error(`❌ [${operationId}] WEBHOOK FAILED (${webhookTime}ms): ${error.message}`);
+            
+            // Log webhook failure but don't throw - let Telegram be the backup
+            return false;
+        }
+    }
+
+    // 🚀 NEW: Format alert optimized for trading bot consumption
+    formatWebhookAlert(analysisResult) {
+        const { tokenInfo, twitterMetrics, analyses, operationId, timer } = analysisResult;
+        
+        return {
+            // Alert metadata
+            source: 'scanner_bot',
+            version: '1.0',
+            timestamp: Date.now(),
+            operationId,
+            
+            // Token data (essential for trading)
+            token: {
+                address: tokenInfo.address || tokenInfo.mint,
+                symbol: tokenInfo.symbol,
+                name: tokenInfo.name,
+                eventType: tokenInfo.eventType || 'creation',
+                creator: tokenInfo.creator
+            },
+            
+            // Twitter engagement (critical for qualification)
+            twitter: {
+                likes: twitterMetrics.likes || 0,
+                views: twitterMetrics.views || 0,
+                url: twitterMetrics.link,
+                publishedAt: twitterMetrics.publishedAt
+            },
+            
+            // Analysis results (risk assessment)
+            analysis: {
+                // Bundle analysis
+                bundleDetected: analyses.bundle?.result?.bundleDetected || false,
+                bundlePercentage: analyses.bundle?.result?.percentageBundled || 0,
+                bundleHoldingPercentage: analyses.bundle?.result?.totalHoldingAmountPercentage || 0,
+                bundleCount: analyses.bundle?.result?.bundles?.length || 0,
+                
+                // Top holders analysis
+                whaleCount: analyses.topHolders?.result?.summary?.whaleCount || 0,
+                freshWalletCount: analyses.topHolders?.result?.summary?.freshWalletCount || 0,
+                top5Concentration: parseFloat(analyses.topHolders?.result?.summary?.concentration?.top5Percentage) || 0,
+                top10Concentration: parseFloat(analyses.topHolders?.result?.summary?.concentration?.top10Percentage) || 0,
+                
+                // Risk assessment
+                riskLevel: this.calculateRiskLevel(analyses),
+                riskScore: this.calculateRiskScore(analyses),
+                confidence: this.calculateConfidence(twitterMetrics, analyses)
+            },
+            
+            // Performance data
+            performance: {
+                analysisSuccess: analysisResult.success,
+                analysisErrors: analysisResult.errors || [],
+                successfulAnalyses: Object.values(analysisResult.analyses).filter(a => a.success).length,
+                totalAnalyses: Object.keys(analysisResult.analyses).length
+            }
+        };
+    }
+
+    // 🚀 NEW: Send webhook request with retry logic
+    async sendWebhookRequest(alert, retries = 1) {
+        for (let attempt = 1; attempt <= retries + 1; attempt++) {
+            try {
+                const response = await axios.post(this.webhookConfig.url, alert, {
+                    timeout: this.webhookConfig.timeout,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': this.webhookConfig.apiKey,
+                        'X-Source': 'scanner-bot',
+                        'X-Version': '1.0'
+                    },
+                    // Aggressive timeouts for speed
+                    validateStatus: (status) => status < 400
+                });
+                
+                // Success on first try or retry
+                if (attempt > 1) {
+                    logger.info(`⚡ Webhook succeeded on attempt ${attempt}`);
+                }
+                
+                return response;
+                
+            } catch (error) {
+                if (attempt <= retries) {
+                    logger.warn(`⚠️ Webhook attempt ${attempt} failed, retrying: ${error.message}`);
+                    // Quick retry delay (100ms)
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+
+    // 🚀 NEW: Calculate alert priority for trading bot
+    calculateAlertPriority(alert) {
+        let score = 0;
+        
+        // High engagement = high priority
+        if (alert.twitter.likes >= 1000) score += 3;
+        else if (alert.twitter.likes >= 500) score += 2;
+        else if (alert.twitter.likes >= 200) score += 1;
+        
+        if (alert.twitter.views >= 1000000) score += 3;
+        else if (alert.twitter.views >= 500000) score += 2;
+        else if (alert.twitter.views >= 100000) score += 1;
+        
+        // Migration events get priority
+        if (alert.token.eventType === 'migration') score += 2;
+        
+        // Risk penalties
+        if (alert.analysis.bundleDetected) score -= 2;
+        if (alert.analysis.whaleCount > 8) score -= 1;
+        if (alert.analysis.freshWalletCount > 10) score -= 1;
+        
+        if (score >= 6) return 'CRITICAL';
+        if (score >= 4) return 'HIGH';
+        if (score >= 2) return 'MEDIUM';
+        return 'LOW';
+    }
+
+    // 🚀 NEW: Update webhook performance statistics
+    updateWebhookStats(latency, success) {
+        this.webhookStats.alertsSent++;
+        
+        if (success) {
+            this.webhookStats.alertsSuccessful++;
+            this.webhookStats.totalLatency += latency;
+            this.webhookStats.averageLatency = this.webhookStats.totalLatency / this.webhookStats.alertsSuccessful;
+            this.webhookStats.fastestAlert = Math.min(this.webhookStats.fastestAlert, latency);
+            this.webhookStats.slowestAlert = Math.max(this.webhookStats.slowestAlert, latency);
+        } else {
+            this.webhookStats.alertsFailed++;
+        }
+    }
+
+    // Updated risk calculation methods
+    calculateRiskLevel(analyses) {
+        const bundleDetected = analyses.bundle?.result?.bundleDetected || false;
+        const whaleCount = analyses.topHolders?.result?.summary?.whaleCount || 0;
+        const freshWalletCount = analyses.topHolders?.result?.summary?.freshWalletCount || 0;
+        const bundlePercentage = analyses.bundle?.result?.percentageBundled || 0;
+        
+        // High risk conditions
+        if (bundleDetected && bundlePercentage > 30) return 'VERY_HIGH';
+        if (whaleCount > 12 || freshWalletCount > 15) return 'VERY_HIGH';
+        
+        // Medium-high risk
+        if (bundleDetected || whaleCount > 8 || freshWalletCount > 10) return 'HIGH';
+        
+        // Medium risk
+        if (whaleCount > 5 || freshWalletCount > 5) return 'MEDIUM';
+        
+        return 'LOW';
+    }
+
+    calculateRiskScore(analyses) {
+        let score = 100; // Start with perfect score
+        
+        // Bundle penalties
+        if (analyses.bundle?.result?.bundleDetected) {
+            const bundlePercentage = analyses.bundle.result.percentageBundled || 0;
+            score -= Math.min(bundlePercentage * 2, 40); // Up to -40 for extreme bundling
+        }
+        
+        // Whale penalties
+        const whaleCount = analyses.topHolders?.result?.summary?.whaleCount || 0;
+        if (whaleCount > 8) score -= (whaleCount - 8) * 5;
+        
+        // Fresh wallet penalties
+        const freshWalletCount = analyses.topHolders?.result?.summary?.freshWalletCount || 0;
+        if (freshWalletCount > 10) score -= (freshWalletCount - 10) * 3;
+        
+        // Concentration penalties
+        const top5Concentration = parseFloat(analyses.topHolders?.result?.summary?.concentration?.top5Percentage) || 0;
+        if (top5Concentration > 80) score -= (top5Concentration - 80) * 2;
+        
+        return Math.max(0, Math.min(100, score));
+    }
+
+    calculateConfidence(twitterMetrics, analyses) {
+        let score = 0;
+        
+        // Twitter engagement scoring
+        if (twitterMetrics.likes >= 1000) score += 3;
+        else if (twitterMetrics.likes >= 500) score += 2;
+        else if (twitterMetrics.likes >= 100) score += 1;
+        
+        if (twitterMetrics.views >= 1000000) score += 3;
+        else if (twitterMetrics.views >= 500000) score += 2;
+        else if (twitterMetrics.views >= 100000) score += 1;
+        
+        // Risk penalties
+        if (analyses.bundle?.result?.bundleDetected) score -= 2;
+        if ((analyses.topHolders?.result?.summary?.whaleCount || 0) > 8) score -= 1;
+        if ((analyses.topHolders?.result?.summary?.freshWalletCount || 0) > 10) score -= 1;
+        
+        if (score >= 5) return 'HIGH';
+        if (score >= 3) return 'MEDIUM';
+        if (score >= 1) return 'LOW';
+        return 'VERY_LOW';
+    }
+
+    // 🚀 NEW: Get webhook statistics
+    getWebhookStats() {
+        const successRate = this.webhookStats.alertsSent > 0 ? 
+            (this.webhookStats.alertsSuccessful / this.webhookStats.alertsSent * 100).toFixed(1) : '0';
+        
+        return {
+            ...this.webhookStats,
+            successRate: successRate + '%',
+            fastestAlert: this.webhookStats.fastestAlert === Infinity ? 0 : this.webhookStats.fastestAlert,
+            config: {
+                enabled: this.webhookConfig.enabled,
+                url: this.webhookConfig.url,
+                timeout: this.webhookConfig.timeout,
+                retries: this.webhookConfig.retries
+            }
+        };
     }
 
     /**
@@ -226,7 +572,8 @@ class AnalysisOrchestrator {
             publishResults: this.config.publishResults,
             saveToJson: this.config.saveToJson,
             maxConcurrentAnalyses: this.config.maxConcurrentAnalyses || 3,
-            botType: this.botType
+            botType: this.botType,
+            webhook: this.webhookConfig
         };
     }
 
@@ -457,6 +804,7 @@ class AnalysisOrchestrator {
             completedAnalyses: this.completedAnalyses.size,
             enabledAnalyses: this.config.enabledAnalyses,
             jsonLogging: this.config.saveToJson,
+            webhook: this.getWebhookStats(),
             config: {
                 analysisTimeout: this.config.analysisTimeout,
                 publishResults: this.config.publishResults,

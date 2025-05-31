@@ -1,4 +1,4 @@
-// src/services/websocketManager.js - Clean and simple
+// src/services/websocketManager.js - Enhanced with comprehensive migration logging
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
@@ -15,8 +15,26 @@ class WebSocketManager extends EventEmitter {
         this.reconnectDelay = config.reconnectDelay || 5000;
         this.connectionId = Math.random().toString(36).substring(7);
         
+        // Track subscriptions to respect bot mode
+        this.subscriptions = {
+            newToken: false,
+            migration: false
+        };
+        
         this.messageStats = {
             received: 0,
+            processed: 0,
+            errors: 0,
+            migrations: 0,  // 🔥 NEW: Track migration count
+            newTokens: 0,   // 🔥 NEW: Track new token count
+            other: 0        // 🔥 NEW: Track other message types
+        };
+
+        // 🔥 NEW: Migration debugging stats
+        this.migrationStats = {
+            total: 0,
+            withMint: 0,
+            withSignature: 0,
             processed: 0,
             errors: 0
         };
@@ -52,8 +70,12 @@ class WebSocketManager extends EventEmitter {
                     return;
                 }
                 
-                // Token creation
-                if (message.txType === 'create') {
+                // 🔥 LOG ALL MESSAGES FIRST (for debugging)
+                this.logRawMessage(message);
+                
+                // Process new tokens
+                if (message.txType === 'create' && this.subscriptions.newToken) {
+                    this.messageStats.newTokens++;
                     logger.info(`[${this.connectionId}] 🪙 NEW TOKEN: ${message.name} (${message.symbol}) - ${message.mint}`);
                     
                     const tokenEvent = {
@@ -71,32 +93,73 @@ class WebSocketManager extends EventEmitter {
                     this.messageStats.processed++;
                     this.emit('newToken', tokenEvent);
                 }
-                // Token migration
-                else if (message.txType === 'migration') {
-                    logger.info(`[${this.connectionId}] 🔄 MIGRATION RAW DATA:`);
-                    logger.info(JSON.stringify(message, null, 2));
+                // 🔥 ENHANCED MIGRATION PROCESSING
+                else if (message.txType === 'migration' && this.subscriptions.migration) {
+                    this.messageStats.migrations++;
+                    this.migrationStats.total++;
                     
-                    const migrationEvent = {
-                        eventType: 'migration',
-                        mint: message.mint,
-                        signature: message.signature,
-                        timestamp: Date.now(),
-                        operationId: `${message.mint}_migration_${Date.now()}`,
-                        timer: createTimer(`${message.mint}_migration_${Date.now()}`),
-                        rawData: message
-                    };
+                    // 🔥 ALWAYS LOG MIGRATION DATA (even if processing fails)
+                    logger.info(`[${this.connectionId}] 🔄 MIGRATION DETECTED:`);
+                    logger.info(`   • Raw Data: ${JSON.stringify(message, null, 2)}`);
                     
-                    this.messageStats.processed++;
-                    this.emit('tokenMigration', migrationEvent);
+                    // Validate migration data
+                    if (message.mint) {
+                        this.migrationStats.withMint++;
+                        logger.info(`   • Mint: ${message.mint}`);
+                    } else {
+                        logger.warn(`   • ⚠️ Missing mint field!`);
+                    }
+                    
+                    if (message.signature) {
+                        this.migrationStats.withSignature++;
+                        logger.info(`   • Signature: ${message.signature}`);
+                    } else {
+                        logger.warn(`   • ⚠️ Missing signature field!`);
+                    }
+                    
+                    // Log all available fields
+                    const fields = Object.keys(message);
+                    logger.info(`   • Available fields: ${fields.join(', ')}`);
+                    
+                    try {
+                        const migrationEvent = {
+                            eventType: 'migration',
+                            mint: message.mint,
+                            signature: message.signature,
+                            timestamp: Date.now(),
+                            operationId: `${message.mint || 'unknown'}_migration_${Date.now()}`,
+                            timer: createTimer(`${message.mint || 'unknown'}_migration_${Date.now()}`),
+                            rawData: message // Include full raw data
+                        };
+                        
+                        this.migrationStats.processed++;
+                        this.messageStats.processed++;
+                        
+                        logger.info(`[${this.connectionId}] ✅ Migration event created for ${message.mint}`);
+                        this.emit('tokenMigration', migrationEvent);
+                        
+                    } catch (migrationError) {
+                        this.migrationStats.errors++;
+                        logger.error(`[${this.connectionId}] ❌ Error creating migration event:`, migrationError);
+                        logger.error(`   • Message that caused error: ${JSON.stringify(message, null, 2)}`);
+                    }
                 }
-                // Everything else
+                // Log ignored messages for debugging
+                else if (message.txType === 'create' && !this.subscriptions.newToken) {
+                    logger.debug(`[${this.connectionId}] 🚫 IGNORED NEW TOKEN (not subscribed): ${message.name || 'Unknown'}`);
+                }
+                else if (message.txType === 'migration' && !this.subscriptions.migration) {
+                    logger.debug(`[${this.connectionId}] 🚫 IGNORED MIGRATION (not subscribed): ${message.mint || 'Unknown'}`);
+                }
                 else {
+                    this.messageStats.other++;
                     logger.debug(`[${this.connectionId}] OTHER: ${message.txType || 'NO_TYPE'} | Keys: ${Object.keys(message).join(', ')}`);
                 }
                 
             } catch (error) {
                 this.messageStats.errors++;
                 logger.error(`[${this.connectionId}] Parse error:`, error);
+                logger.error(`[${this.connectionId}] Raw message that failed: ${data.toString()}`);
             }
         });
 
@@ -114,6 +177,23 @@ class WebSocketManager extends EventEmitter {
                 this.scheduleReconnect();
             }
         });
+    }
+
+    // 🔥 NEW: Log raw messages for debugging
+    logRawMessage(message) {
+        const txType = message.txType || 'UNKNOWN';
+        const fields = Object.keys(message);
+        
+        // Log every 100th message to avoid spam, but always log migrations
+        if (txType === 'migration' || this.messageStats.received % 100 === 0) {
+            logger.debug(`[${this.connectionId}] RAW MESSAGE #${this.messageStats.received}:`);
+            logger.debug(`   • Type: ${txType}`);
+            logger.debug(`   • Fields: ${fields.join(', ')}`);
+            
+            if (txType === 'migration') {
+                logger.debug(`   • Full Data: ${JSON.stringify(message, null, 2)}`);
+            }
+        }
     }
 
     scheduleReconnect() {
@@ -147,6 +227,7 @@ class WebSocketManager extends EventEmitter {
 
     subscribeNewToken() {
         if (this.send({ method: 'subscribeNewToken' })) {
+            this.subscriptions.newToken = true;
             logger.info(`[${this.connectionId}] ✅ Subscribed to new tokens`);
             return true;
         }
@@ -155,6 +236,7 @@ class WebSocketManager extends EventEmitter {
 
     subscribeMigration() {
         if (this.send({ method: 'subscribeMigration' })) {
+            this.subscriptions.migration = true;
             logger.info(`[${this.connectionId}] ✅ Subscribed to migrations`);
             return true;
         }
@@ -162,17 +244,73 @@ class WebSocketManager extends EventEmitter {
     }
 
     resubscribeAll() {
-        setTimeout(() => this.subscribeNewToken(), 100);
-        setTimeout(() => this.subscribeMigration(), 200);
+        if (this.subscriptions.newToken) {
+            setTimeout(() => this.subscribeNewToken(), 100);
+        }
+        if (this.subscriptions.migration) {
+            setTimeout(() => this.subscribeMigration(), 200);
+        }
+        
+        // Log what we're resubscribing to
+        const subs = [];
+        if (this.subscriptions.newToken) subs.push('newToken');
+        if (this.subscriptions.migration) subs.push('migration');
+        logger.info(`[${this.connectionId}] 🔄 Resubscribing to: ${subs.join(', ') || 'nothing'}`);
     }
 
+    // 🔥 ENHANCED: Get detailed connection info including migration stats
     getConnectionInfo() {
         return {
             connectionId: this.connectionId,
             isConnected: this.isConnected,
             reconnectAttempts: this.reconnectAttempts,
-            messageStats: this.messageStats
+            messageStats: this.messageStats,
+            subscriptions: this.subscriptions,
+            migrationStats: this.migrationStats, // 🔥 NEW: Migration debugging info
+            detailedStats: {
+                totalMessages: this.messageStats.received,
+                newTokens: this.messageStats.newTokens,
+                migrations: this.messageStats.migrations,
+                other: this.messageStats.other,
+                errors: this.messageStats.errors,
+                processed: this.messageStats.processed
+            }
         };
+    }
+
+    // 🔥 NEW: Get migration statistics
+    getMigrationStats() {
+        return {
+            ...this.migrationStats,
+            successRate: this.migrationStats.total > 0 ? 
+                ((this.migrationStats.processed / this.migrationStats.total) * 100).toFixed(1) + '%' : '0%',
+            dataQuality: {
+                withMint: this.migrationStats.withMint,
+                withSignature: this.migrationStats.withSignature,
+                completeness: this.migrationStats.total > 0 ? 
+                    ((this.migrationStats.withMint / this.migrationStats.total) * 100).toFixed(1) + '%' : '0%'
+            }
+        };
+    }
+
+    // 🔥 NEW: Log comprehensive stats periodically
+    logStats() {
+        logger.info(`[${this.connectionId}] 📊 WebSocket Stats:`);
+        logger.info(`   • Total Messages: ${this.messageStats.received}`);
+        logger.info(`   • New Tokens: ${this.messageStats.newTokens}`);
+        logger.info(`   • Migrations: ${this.messageStats.migrations}`);
+        logger.info(`   • Other: ${this.messageStats.other}`);
+        logger.info(`   • Errors: ${this.messageStats.errors}`);
+        logger.info(`   • Processed: ${this.messageStats.processed}`);
+        
+        if (this.migrationStats.total > 0) {
+            logger.info(`[${this.connectionId}] 🔄 Migration Stats:`);
+            logger.info(`   • Total Detected: ${this.migrationStats.total}`);
+            logger.info(`   • With Mint: ${this.migrationStats.withMint}/${this.migrationStats.total}`);
+            logger.info(`   • With Signature: ${this.migrationStats.withSignature}/${this.migrationStats.total}`);
+            logger.info(`   • Successfully Processed: ${this.migrationStats.processed}/${this.migrationStats.total}`);
+            logger.info(`   • Errors: ${this.migrationStats.errors}`);
+        }
     }
 
     disconnect() {
@@ -181,6 +319,11 @@ class WebSocketManager extends EventEmitter {
             this.ws = null;
         }
         this.isConnected = false;
+        // Reset subscriptions
+        this.subscriptions = {
+            newToken: false,
+            migration: false
+        };
     }
 }
 

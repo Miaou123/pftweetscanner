@@ -1,399 +1,483 @@
-// src/publishers/telegramPublisher.js - Fixed to properly display views
+// Updated AnalysisOrchestrator with simplified config
+const path = require('path');
 const logger = require('../utils/logger');
-const { formatNumber } = require('../utils/formatters');
+const BundleAnalyzer = require('../analysis/bundleAnalyzer');
+const TopHoldersAnalyzer = require('../analysis/topHoldersAnalyzer');
+const TelegramPublisher = require('../publishers/telegramPublisher');
+const JsonLogger = require('../services/jsonLogger');
+const config = require('../config'); // FIXED: Use simplified config
 
-class TelegramPublisher {
+class AnalysisOrchestrator {
     constructor(config = {}) {
+        // Determine bot type from config
+        this.botType = config.botType || 'creation'; // 'creation' or 'migration'
+        
         this.config = {
-            botToken: config.botToken || process.env.TELEGRAM_BOT_TOKEN,
-            channels: config.channels || [
-                process.env.TELEGRAM_CHANNEL_ID || process.env.TELEGRAM_CHAT_ID
-            ].filter(Boolean),
-            maxMessageLength: config.maxMessageLength || 4096,
-            enablePreviews: config.enablePreviews !== false,
-            retryAttempts: config.retryAttempts || 3,
-            retryDelay: config.retryDelay || 5000,
+            analysisTimeout: config.analysisTimeout || 5 * 60 * 1000,
+            publishResults: config.publishResults !== false,
+            saveToJson: config.saveToJson !== false, // Enable JSON logging by default
             ...config
         };
 
-        // Initialize Telegram client
-        if (this.config.botToken) {
-            this.TelegramBot = require('node-telegram-bot-api');
-            this.bot = new this.TelegramBot(this.config.botToken);
-        } else {
-            logger.warn('No Telegram bot token provided - publishing disabled');
-        }
+        // Get bot-specific enabled analyses from simplified config
+        const botSpecificConfig = require('../config').getConfigForBot(this.botType);
+        this.config.enabledAnalyses = botSpecificConfig.enabledAnalyses;
+        this.config.maxConcurrentAnalyses = botSpecificConfig.maxConcurrent;
+
+        logger.info(`🔬 AnalysisOrchestrator initialized for ${this.botType} bot`);
+        logger.info(`📋 Enabled analyses: ${this.config.enabledAnalyses.join(', ')}`);
+
+        this.bundleAnalyzer = BundleAnalyzer;
+        this.topHoldersAnalyzer = new TopHoldersAnalyzer();
+        this.telegramPublisher = new TelegramPublisher(config.telegram || {});
+        
+        // Initialize JSON logger
+        this.jsonLogger = new JsonLogger({
+            logsDirectory: config.jsonLogsDirectory || path.join(process.cwd(), 'scan_results'),
+            rotateDaily: config.rotateDailyLogs !== false
+        });
+        
+        // Analysis state
+        this.activeAnalyses = new Map();
+        this.completedAnalyses = new Map();
     }
 
-    async publishAnalysis(analysisResult) {
-        if (!this.bot || !this.config.channels.length) {
-            logger.warn('Telegram publishing not configured');
-            return;
-        }
-
-        try {
-            const message = this.formatAnalysisMessage(analysisResult);
-            
-            // Send to all configured channels
-            const promises = this.config.channels.map(channelId => 
-                this.sendMessage(channelId, message)
-            );
-
-            const results = await Promise.allSettled(promises);
-            const successful = results.filter(r => r.status === 'fulfilled').length;
-            
-            // Log final timing
-            if (analysisResult.timer) {
-                logger.info(`⏱️ [${analysisResult.operationId}] Total pipeline time: ${analysisResult.timer.getElapsedSeconds()}s`);
-            }
-            
-            logger.info(`📤 Published analysis to ${successful}/${this.config.channels.length} channels`);
-
-        } catch (error) {
-            logger.error('Error publishing analysis to Telegram:', error);
-        }
-    }
-
-    formatAnalysisMessage(analysisResult) {
-        const { tokenInfo, twitterMetrics, analyses, operationId, summary } = analysisResult;
+    async analyzeToken(tokenData) {
+        const { tokenAddress, tokenInfo, twitterMetrics, operationId, timer } = tokenData;
         
-        // Check if analysis completely failed
-        if (summary && summary.analysisError) {
-            return this.formatFailedAnalysis(tokenInfo, twitterMetrics, operationId, analysisResult.timer);
-        }
+        logger.info(`🔬 [${operationId}] Starting comprehensive analysis for ${tokenInfo.symbol} (${tokenAddress})`);
+        logger.info(`🔬 [${operationId}] Bot type: ${this.botType}, Enabled analyses: ${this.config.enabledAnalyses.join(', ')}`);
         
-        // Header with token info and PROPER Twitter metrics display
-        let message = this.formatHeader(tokenInfo, twitterMetrics);
-        
-        // Bundle analysis results
-        if (analyses.bundle && analyses.bundle.success) {
-            message += this.formatBundleAnalysis(analyses.bundle.result);
-        } else if (analyses.bundle && !analyses.bundle.success) {
-            message += '<b>📦 Bundle Analysis:</b>\n• ❌ Analysis failed (token too new)\n\n';
-        }
-        
-        // Top Holders analysis results
-        if (analyses.topHolders && analyses.topHolders.success) {
-            message += this.formatTopHoldersAnalysis(analyses.topHolders.result);
-        } else if (analyses.topHolders && !analyses.topHolders.success) {
-            message += '<b>👥 Top Holders Analysis:</b>\n• ❌ Analysis failed (token too new)\n\n';
-        }
-    
-        // Links and footer
-        message += this.formatFooter(tokenInfo.address || tokenInfo.mint, operationId, twitterMetrics.link, analysisResult.timer);
-        
-        // Truncate if too long
-        if (message.length > this.config.maxMessageLength) {
-            message = this.truncateMessage(message);
-        }
-        
-        return message;
-    }
-
-    formatFailedAnalysis(tokenInfo, twitterMetrics, operationId, timer) {
-        const symbol = tokenInfo.symbol || 'Unknown';
-        const name = tokenInfo.name || 'Unknown Token';
-        const address = tokenInfo.address || tokenInfo.mint || '';
-        const eventType = tokenInfo.eventType === 'migration' ? '🔄 MIGRATION' : '🆕 NEW TOKEN';
-        
-        let message = `${eventType} | <b>${symbol}</b>\n`;
-        message += `${name}\n`;
-        message += `<code>${address}</code>\n`;
-        
-        // FIXED: Proper Twitter metrics display for failed analysis
-        if (twitterMetrics) {
-            const twitterLine = this.formatTwitterMetricsLine(twitterMetrics);
-            if (twitterLine) {
-                message += `${twitterLine}\n`;
-            }
-        }
-        
-        message += '\n';
-        message += '<b>⚠️ Analysis Failed</b>\n';
-        message += '• Token migrated too quickly for indexing\n';
-        message += '• Analysis data not yet available\n';
-        message += '• Check manually using links below\n\n';
-        
-        // Links section
-        message += '<b>🔗 Links:</b>\n';
-        message += `🐦 <a href="${twitterMetrics?.link || '#'}">Tweet</a> | `;
-        message += `📈 <a href="https://dexscreener.com/solana/${address}">DexScreener</a> | `;
-        message += `🔥 <a href="https://pump.fun/${address}">Pump.fun</a> | `;
-        message += `📊 <a href="https://solscan.io/token/${address}">Solscan</a>\n\n`;
-        
-        // Footer with timing
-        if (timer) {
-            message += `<i>Analysis time: ${timer.getElapsedSeconds()}s | ID: ${operationId}</i>`;
-        } else {
-            message += `<i>Analysis ID: ${operationId}</i>`;
-        }
-        
-        return message;
-    }
-
-    formatHeader(tokenInfo, twitterMetrics) {
-        const symbol = tokenInfo.symbol || 'Unknown';
-        const name = tokenInfo.name || 'Unknown Token';
-        const address = tokenInfo.address || tokenInfo.mint || '';
-        const eventType = tokenInfo.eventType === 'migration' ? '🔄 MIGRATION' : '🆕 NEW TOKEN';
-        
-        let header = `${eventType} | <b>${symbol}</b>\n`;
-        header += `${name}\n`;
-        header += `<code>${address}</code>\n`;
-        
-        // FIXED: Use the new Twitter metrics formatting
-        if (twitterMetrics) {
-            const twitterLine = this.formatTwitterMetricsLine(twitterMetrics);
-            if (twitterLine) {
-                header += `${twitterLine}\n`;
-            }
-        }
-        
-        return header + '\n';
-    }
-
-    // NEW METHOD: Properly format Twitter metrics line with views priority
-    formatTwitterMetricsLine(twitterMetrics) {
-        if (!twitterMetrics) return '';
-        
-        const parts = [];
-        
-        // PRIORITY 1: Show views if available (this was missing proper formatting)
-        if (twitterMetrics.views && twitterMetrics.views > 0) {
-            parts.push(`👀 ${this.formatNumber(twitterMetrics.views)} views`);
-        }
-        
-        // PRIORITY 2: Show likes if available  
-        if (twitterMetrics.likes && twitterMetrics.likes > 0) {
-            parts.push(`❤️ ${this.formatNumber(twitterMetrics.likes)} likes`);
-        }
-        
-        // If we have engagement metrics, format the line
-        if (parts.length > 0) {
-            let twitterLine = `🐦 ${parts.join(' • ')}`;
-            
-            // Add time if available
-            if (twitterMetrics.publishedAt) {
-                const timeAgo = this.formatTimeAgo(twitterMetrics.publishedAt);
-                twitterLine += ` • 📅 ${timeAgo}`;
-            }
-            
-            return twitterLine;
-        }
-        
-        return '';
-    }
-
-    // FIXED: Update formatNumber to handle larger numbers correctly
-    formatNumber(num) {
-        if (num === null || num === undefined || isNaN(num)) {
-            return '0';
-        }
-        
-        const absNum = Math.abs(num);
-        
-        if (absNum >= 1000000000) {
-            return (num / 1000000000).toFixed(1) + 'B';
-        }
-        if (absNum >= 1000000) {
-            return (num / 1000000).toFixed(1) + 'M';
-        }
-        if (absNum >= 1000) {
-            return (num / 1000).toFixed(1) + 'K';
-        }
-        
-        return Math.round(num).toLocaleString();
-    }
-
-    formatBundleAnalysis(result) {
-        if (!result) return '';
-        
-        let section = '<b>📦 Bundle Analysis:</b>\n';
-        
-        if (result.bundleDetected) {
-            const totalBoughtPercentage = result.percentageBundled || 0;
-            const currentlyHeldPercentage = result.totalHoldingAmountPercentage || 0;
-            
-            section += `• Bundles Found: ${result.bundles.length}\n`;
-            section += `• Tokens Bundled: ${this.formatLargeNumber(result.totalTokensBundled)} (${totalBoughtPercentage.toFixed(2)}%)\n`;
-            section += `• Currently Held: ${this.formatLargeNumber(result.totalHoldingAmount)} (${currentlyHeldPercentage.toFixed(2)}%)\n`;
-            
-        } else {
-            section += '✅ No significant bundling detected\n';
-        }
-        
-        return section + '\n';
-    }
-
-    formatTopHoldersAnalysis(result) {
-        if (!result || !result.summary) {
-            return '<b>👥 Top Holders Analysis:</b>\n• Analysis unavailable (token too new)\n\n';
-        }
-        
-        const summary = result.summary;
-        let section = '<b>👥 Top Holders Analysis:</b>\n';
-        
-        // Only show if we have meaningful data
-        if (summary.totalHolders > 0) {
-            // Wallet type breakdown (remove Regular count)
-            section += `• 🐋 Whales: ${summary.whaleCount}/20 (${summary.whalePercentage}%)\n`;
-            section += `• 🆕 Fresh Wallets: ${summary.freshWalletCount}/20 (${summary.freshWalletPercentage}%)\n`;
-            
-            // Show top 10 holdings instead of top 5
-            section += `• Top 10 Holdings: ${summary.concentration.top10Percentage}%\n`;
-            
-        } else {
-            section += '• Analysis incomplete (insufficient holder data)\n';
-        }
-        
-        return section + '\n';
-    }
-
-    formatLargeNumber(num) {
-        if (!num || isNaN(num)) return '0';
-        
-        if (num >= 1000000000) {
-            return (num / 1000000000).toFixed(1) + 'B';
-        }
-        if (num >= 1000000) {
-            return (num / 1000000).toFixed(1) + 'M';
-        }
-        if (num >= 1000) {
-            return (num / 1000).toFixed(1) + 'K';
-        }
-        
-        return Math.round(num).toString();
-    }
-
-    formatFooter(tokenAddress, operationId, twitterLink, timer = null) {
-        let footer = '<b>🔗 Links:</b>\n';
-        footer += `🐦 <a href="${twitterLink}">Tweet</a> | `;
-        footer += `📈 <a href="https://dexscreener.com/solana/${tokenAddress}">DexScreener</a> | `;
-        footer += `🔥 <a href="https://pump.fun/${tokenAddress}">Pump.fun</a> | `;
-        footer += `📊 <a href="https://solscan.io/token/${tokenAddress}">Solscan</a>\n\n`;
-        
-        // Add analysis time if timer is available
-        if (timer) {
-            footer += `<i>Analysis time: ${timer.getElapsedSeconds()}s | ID: ${operationId}</i>`;
-        } else {
-            footer += `<i>Analysis ID: ${operationId}</i>`;
-        }
-        
-        return footer;
-    }
-
-    formatTimeAgo(isoDate) {
-        if (!isoDate) return '';
-        
-        try {
-            const now = new Date();
-            const published = new Date(isoDate);
-            const diffMs = now - published;
-            const diffMins = Math.floor(diffMs / (1000 * 60));
-            const diffHours = Math.floor(diffMins / 60);
-            const diffDays = Math.floor(diffHours / 24);
-            
-            if (diffMins < 1) {
-                return 'now';
-            } else if (diffMins < 60) {
-                return `${diffMins}m ago`;
-            } else if (diffHours < 24) {
-                return `${diffHours}h ago`;
-            } else if (diffDays < 7) {
-                return `${diffDays}d ago`;
-            } else {
-                return published.toLocaleDateString();
-            }
-        } catch (error) {
-            logger.debug('Error formatting time ago:', error);
-            return '';
-        }
-    }
-
-    truncateMessage(message) {
-        if (message.length <= this.config.maxMessageLength) {
-            return message;
-        }
-        
-        const truncated = message.substring(0, this.config.maxMessageLength - 100);
-        const lastNewline = truncated.lastIndexOf('\n');
-        
-        return truncated.substring(0, lastNewline) + '\n\n<i>... (message truncated)</i>';
-    }
-
-    async sendMessage(channelId, message, options = {}) {
-        if (!this.bot) {
-            logger.warn('Telegram bot not initialized');
-            return;
-        }
-
-        const sendOptions = {
-            parse_mode: 'HTML',
-            disable_web_page_preview: true,
-            ...options
+        const analysisResult = {
+            tokenAddress,
+            tokenInfo,
+            twitterMetrics,
+            operationId,
+            startTime: Date.now(),
+            success: false,
+            analyses: {},
+            errors: [],
+            summary: {},
+            timer: timer
         };
 
-        for (let attempt = 1; attempt <= this.config.retryAttempts; attempt++) {
-            try {
-                const result = await this.bot.sendMessage(channelId, message, sendOptions);
-                logger.debug(`Message sent to ${channelId} successfully`);
-                return result;
-            } catch (error) {
-                logger.warn(`Attempt ${attempt}/${this.config.retryAttempts} failed for channel ${channelId}:`, error.message);
-                
-                if (attempt < this.config.retryAttempts) {
-                    await new Promise(resolve => setTimeout(resolve, this.config.retryDelay * attempt));
-                } else {
-                    logger.error(`Failed to send message to ${channelId} after ${this.config.retryAttempts} attempts`);
-                    throw error;
-                }
+        // Create cancellation token for timeout handling
+        const cancellationToken = this.createCancellationToken(this.config.analysisTimeout);
+        this.activeAnalyses.set(operationId, cancellationToken);
+
+        try {
+            const analysisPromises = [];
+
+            // Run analyses based on what's enabled for this bot type
+            if (this.config.enabledAnalyses.includes('bundle')) {
+                logger.info(`🔬 [${operationId}] Starting bundle analysis (parallel)`);
+                analysisPromises.push(
+                    this.runAnalysisWithTimeout(
+                        'bundle',
+                        () => this.bundleAnalyzer.analyzeBundle(tokenAddress, 50000),
+                        operationId,
+                        cancellationToken
+                    )
+                );
+            } else {
+                logger.debug(`🔬 [${operationId}] Bundle analysis disabled for ${this.botType} bot`);
             }
+
+            if (this.config.enabledAnalyses.includes('topHolders')) {
+                logger.info(`🔬 [${operationId}] Starting top holders analysis (parallel)`);
+                analysisPromises.push(
+                    this.runAnalysisWithTimeout(
+                        'topHolders',
+                        () => this.topHoldersAnalyzer.analyzeTopHolders(tokenAddress, 20),
+                        operationId,
+                        cancellationToken
+                    )
+                );
+            } else {
+                logger.debug(`🔬 [${operationId}] Top holders analysis disabled for ${this.botType} bot`);
+            }
+
+            if (analysisPromises.length === 0) {
+                logger.warn(`🔬 [${operationId}] No analyses enabled for ${this.botType} bot!`);
+                throw new Error(`No analyses enabled for ${this.botType} bot`);
+            }
+
+            // Wait for ALL analyses to complete in parallel
+            logger.info(`🔬 [${operationId}] Running ${analysisPromises.length} analyses in parallel...`);
+            const analysisResults = await Promise.allSettled(analysisPromises);
+            logger.info(`🔬 [${operationId}] All parallel analyses completed`);
+
+            // Process results
+            analysisResults.forEach((result, index) => {
+                const analysisType = this.config.enabledAnalyses.filter(type => 
+                    ['bundle', 'topHolders', 'devAnalysis'].includes(type)
+                )[index];
+                
+                if (result.status === 'fulfilled') {
+                    analysisResult.analyses[analysisType] = result.value;
+                    if (!result.value.success) {
+                        analysisResult.errors.push(`${analysisType}: ${result.value.error}`);
+                    }
+                } else {
+                    analysisResult.analyses[analysisType] = {
+                        success: false,
+                        error: result.reason.message || 'Unknown error',
+                        type: analysisType
+                    };
+                    analysisResult.errors.push(`${analysisType}: ${result.reason.message || 'Unknown error'}`);
+                }
+            });
+            
+            // Generate comprehensive summary
+            this.generateComprehensiveSummary(analysisResult);
+
+            // Determine overall success
+            const successfulAnalyses = Object.values(analysisResult.analyses)
+                .filter(analysis => analysis.success).length;
+
+            analysisResult.success = successfulAnalyses > 0;
+            analysisResult.endTime = Date.now();
+            analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
+
+            // Save to JSON file before publishing
+            if (this.config.saveToJson) {
+                await this.saveToJsonLog(analysisResult);
+            }
+
+            // Publish results to Telegram
+            if (this.config.publishResults) {
+                await this.publishResults(analysisResult);
+            }
+
+            if (analysisResult.success) {
+                logger.info(`✅ [${operationId}] Comprehensive analysis completed successfully in ${analysisResult.duration}ms`);
+                logger.info(`📊 [${operationId}] Results: ${successfulAnalyses}/${Object.keys(analysisResult.analyses).length} analyses successful`);
+            } else {
+                logger.warn(`⚠️ [${operationId}] All analyses failed - but notification sent`);
+            }
+
+            return analysisResult;
+
+        } catch (error) {
+            logger.error(`❌ [${operationId}] Analysis orchestration failed:`, error);
+            analysisResult.error = error.message;
+            analysisResult.endTime = Date.now();
+            analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
+            
+            // Save failed analysis to JSON as well
+            if (this.config.saveToJson) {
+                await this.saveToJsonLog(analysisResult);
+            }
+            
+            return analysisResult;
+        } finally {
+            this.activeAnalyses.delete(operationId);
+            this.completedAnalyses.set(operationId, analysisResult);
+            
+            // Clean up old completed analyses
+            this.cleanupCompletedAnalyses();
         }
     }
 
-    async publishSimpleAlert(tokenInfo, message, priority = 'normal') {
-        if (!this.bot || !this.config.channels.length) {
+    /**
+     * Save analysis result to JSON log - only basics
+     */
+    async saveToJsonLog(analysisResult) {
+        try {
+            await this.jsonLogger.saveScanResult(analysisResult);
+        } catch (error) {
+            // Silent fail to avoid log spam
+        }
+    }
+
+    /**
+     * Get JSON logging statistics
+     */
+    async getJsonLogStats() {
+        try {
+            return await this.jsonLogger.getStats();
+        } catch (error) {
+            logger.error('Error getting JSON log stats:', error);
+            return { totalFiles: 0, creationFiles: 0, migrationFiles: 0, files: [] };
+        }
+    }
+
+    /**
+     * Read scan results from JSON logs
+     */
+    async readScanResults(eventType, date = null) {
+        try {
+            return await this.jsonLogger.readScanResults(eventType, date);
+        } catch (error) {
+            logger.error('Error reading scan results:', error);
+            return [];
+        }
+    }
+
+    // Keep all your existing methods unchanged...
+    getEnabledAnalyses() {
+        return this.config.enabledAnalyses || [];
+    }
+
+    getConfig() {
+        return {
+            enabledAnalyses: this.config.enabledAnalyses,
+            analysisTimeout: this.config.analysisTimeout,
+            publishResults: this.config.publishResults,
+            saveToJson: this.config.saveToJson,
+            maxConcurrentAnalyses: this.config.maxConcurrentAnalyses || 3,
+            botType: this.botType
+        };
+    }
+
+    async runAnalysisWithTimeout(analysisType, analysisFunction, operationId, cancellationToken) {
+        const startTime = Date.now();
+        logger.debug(`[${operationId}] Starting ${analysisType} analysis`);
+
+        try {
+            const timeoutPromise = new Promise((_, reject) => {
+                const timeoutId = setTimeout(() => {
+                    reject(new Error(`${analysisType} analysis timed out`));
+                }, this.config.analysisTimeout);
+
+                cancellationToken.onCancel(() => {
+                    clearTimeout(timeoutId);
+                    reject(new Error(`${analysisType} analysis cancelled`));
+                });
+            });
+
+            const result = await Promise.race([
+                analysisFunction(),
+                timeoutPromise
+            ]);
+
+            const duration = Date.now() - startTime;
+            logger.debug(`[${operationId}] ${analysisType} analysis completed in ${duration}ms`);
+
+            return {
+                type: analysisType,
+                success: true,
+                result,
+                duration,
+                error: null
+            };
+
+        } catch (error) {
+            const duration = Date.now() - startTime;
+            logger.warn(`[${operationId}] ${analysisType} analysis failed after ${duration}ms:`, error.message);
+
+            return {
+                type: analysisType,
+                success: false,
+                result: null,
+                duration,
+                error: error.message
+            };
+        }
+    }
+
+    generateComprehensiveSummary(analysisResult) {
+        const bundleAnalysis = analysisResult.analyses.bundle;
+        const topHoldersAnalysis = analysisResult.analyses.topHolders;
+        
+        const summary = {
+            totalAnalyses: Object.keys(analysisResult.analyses).length,
+            successfulAnalyses: Object.values(analysisResult.analyses).filter(a => a.success).length,
+            failedAnalyses: Object.values(analysisResult.analyses).filter(a => !a.success).length,
+            flags: [],
+            scores: {},
+            alerts: [],
+            analysisError: false
+        };
+
+        if (summary.successfulAnalyses === 0) {
+            summary.analysisError = true;
+            summary.flags.push('⚠️ Analysis failed - Token too new for indexing');
+            summary.riskLevel = 'UNKNOWN';
+            summary.overallScore = 0;
+            analysisResult.summary = summary;
             return;
         }
 
-        const priorityEmoji = priority === 'high' ? '🚨' : '📢';
-        const fullMessage = `${priorityEmoji} <b>${tokenInfo.symbol || 'Token Alert'}</b>\n\n${message}`;
+        // Process Bundle Analysis Results
+        if (bundleAnalysis?.success && bundleAnalysis.result) {
+            const bundleResult = bundleAnalysis.result;
+            
+            if (bundleResult.bundleDetected) {
+                summary.flags.push(`🔴 Bundle detected: ${bundleResult.percentageBundled?.toFixed(2)}% of supply`);
+                summary.alerts.push({
+                    type: 'bundle',
+                    severity: 'high',
+                    message: `Bundle activity detected (${bundleResult.percentageBundled?.toFixed(2)}%)`
+                });
+            }
+            
+            summary.scores.bundle = bundleResult.bundleDetected ? 20 : 100;
+            summary.bundleData = {
+                detected: bundleResult.bundleDetected,
+                percentage: bundleResult.percentageBundled,
+                holdingPercentage: bundleResult.totalHoldingAmountPercentage,
+                bundleCount: bundleResult.bundles?.length || 0
+            };
+        } else if (bundleAnalysis && !bundleAnalysis.success) {
+            summary.flags.push('⚠️ Bundle analysis failed');
+        }
 
+        // Process Top Holders Analysis Results
+        if (topHoldersAnalysis?.success && topHoldersAnalysis.result && topHoldersAnalysis.result.summary) {
+            const holdersResult = topHoldersAnalysis.result;
+            const holdersSummary = holdersResult.summary;
+            
+            if (holdersSummary.whaleCount > 8) {
+                summary.flags.push(`🔴 High whale concentration: ${holdersSummary.whaleCount}/20 holders`);
+                summary.alerts.push({
+                    type: 'whales',
+                    severity: 'high',
+                    message: `High whale concentration (${holdersSummary.whaleCount}/20)`
+                });
+            } else if (holdersSummary.whaleCount > 5) {
+                summary.flags.push(`🟡 Moderate whale presence: ${holdersSummary.whaleCount}/20 holders`);
+            }
+
+            if (holdersSummary.freshWalletCount > 10) {
+                summary.flags.push(`🔴 High fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
+                summary.alerts.push({
+                    type: 'fresh_wallets',
+                    severity: 'high',
+                    message: `High fresh wallet count (${holdersSummary.freshWalletCount}/20)`
+                });
+            } else if (holdersSummary.freshWalletCount > 5) {
+                summary.flags.push(`🟡 Moderate fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
+            }
+
+            const top5Concentration = parseFloat(holdersSummary.concentration.top5Percentage);
+            if (top5Concentration > 80) {
+                summary.flags.push(`🔴 Very high concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
+                summary.alerts.push({
+                    type: 'concentration',
+                    severity: 'high',
+                    message: `Very high concentration (${top5Concentration.toFixed(1)}%)`
+                });
+            } else if (top5Concentration > 60) {
+                summary.flags.push(`🟡 High concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
+            }
+
+            summary.scores.topHolders = holdersSummary.riskScore;
+            summary.holdersData = {
+                whaleCount: holdersSummary.whaleCount,
+                freshWalletCount: holdersSummary.freshWalletCount,
+                regularWalletCount: holdersSummary.regularWalletCount,
+                concentration: holdersSummary.concentration,
+                riskLevel: holdersSummary.riskLevel
+            };
+        } else if (topHoldersAnalysis && !topHoldersAnalysis.success) {
+            summary.flags.push('⚠️ Top holders analysis failed');
+        }
+
+        // Calculate overall score and risk level
+        const scores = Object.values(summary.scores).filter(score => typeof score === 'number');
+        summary.overallScore = scores.length > 0 ? 
+            Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length) : 0;
+        
+        summary.riskLevel = this.determineOverallRiskLevel(summary.overallScore, summary.alerts);
+
+        if (summary.flags.length === 0 && summary.successfulAnalyses > 0) {
+            summary.flags.push('✅ No major red flags detected');
+        }
+
+        analysisResult.summary = summary;
+    }
+
+    determineOverallRiskLevel(score, alerts) {
+        const highSeverityAlerts = alerts.filter(alert => alert.severity === 'high').length;
+        
+        if (highSeverityAlerts >= 2 || score < 40) return 'VERY_HIGH';
+        if (highSeverityAlerts >= 1 || score < 60) return 'HIGH';
+        if (score < 80) return 'MEDIUM';
+        return 'LOW';
+    }
+
+    async publishResults(analysisResult) {
         try {
-            const promises = this.config.channels.map(channelId => 
-                this.sendMessage(channelId, fullMessage)
-            );
-
-            await Promise.allSettled(promises);
-            logger.info(`Alert published for ${tokenInfo.symbol}`);
+            logger.info(`📤 [${analysisResult.operationId}] Publishing comprehensive analysis results`);
+            await this.telegramPublisher.publishAnalysis(analysisResult);
         } catch (error) {
-            logger.error('Error publishing alert:', error);
+            logger.error(`Failed to publish results for ${analysisResult.operationId}:`, error);
+        }
+    }
+
+    createCancellationToken(timeout) {
+        const token = {
+            cancelled: false,
+            callbacks: []
+        };
+
+        token.cancel = () => {
+            token.cancelled = true;
+            token.callbacks.forEach(callback => callback());
+        };
+
+        token.isCancelled = () => token.cancelled;
+
+        token.onCancel = (callback) => {
+            if (token.cancelled) {
+                callback();
+            } else {
+                token.callbacks.push(callback);
+            }
+        };
+
+        setTimeout(() => {
+            if (!token.cancelled) {
+                logger.warn(`Analysis timed out after ${timeout}ms`);
+                token.cancel();
+            }
+        }, timeout);
+
+        return token;
+    }
+
+    cleanupCompletedAnalyses() {
+        if (this.completedAnalyses.size > 100) {
+            const entries = Array.from(this.completedAnalyses.entries());
+            const toDelete = entries.slice(0, entries.length - 100);
+            
+            toDelete.forEach(([operationId]) => {
+                this.completedAnalyses.delete(operationId);
+            });
+
+            logger.debug(`Cleaned up ${toDelete.length} old analysis results`);
         }
     }
 
     getStatus() {
         return {
-            configured: !!this.bot,
-            channels: this.config.channels.length,
-            maxMessageLength: this.config.maxMessageLength,
-            enablePreviews: this.config.enablePreviews
+            botType: this.botType,
+            activeAnalyses: this.activeAnalyses.size,
+            completedAnalyses: this.completedAnalyses.size,
+            enabledAnalyses: this.config.enabledAnalyses,
+            jsonLogging: this.config.saveToJson,
+            config: {
+                analysisTimeout: this.config.analysisTimeout,
+                publishResults: this.config.publishResults,
+                maxConcurrentAnalyses: this.config.maxConcurrentAnalyses
+            }
         };
     }
 
-    // Test method
-    async testConfiguration() {
-        if (!this.bot || !this.config.channels.length) {
-            return { success: false, error: 'Bot or channels not configured' };
-        }
+    getAnalysisResult(operationId) {
+        return this.completedAnalyses.get(operationId);
+    }
 
-        try {
-            const testMessage = '🧪 <b>Test Message</b>\n\nTelegram publisher is working correctly!';
-            await this.sendMessage(this.config.channels[0], testMessage);
-            return { success: true };
-        } catch (error) {
-            return { success: false, error: error.message };
+    cancelAnalysis(operationId) {
+        const cancellationToken = this.activeAnalyses.get(operationId);
+        if (cancellationToken) {
+            cancellationToken.cancel();
+            logger.info(`Cancelled analysis ${operationId}`);
+            return true;
         }
+        return false;
     }
 }
 
-module.exports = TelegramPublisher;
+module.exports = AnalysisOrchestrator;

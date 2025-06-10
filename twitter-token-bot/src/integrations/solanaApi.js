@@ -1,4 +1,4 @@
-// src/integrations/solanaApi.js - Enhanced with better timeout and error handling
+// src/integrations/solanaApi.js - SIMPLE FIX: Remove retries, single attempt only
 const axios = require('axios');
 const logger = require('../utils/logger');
 const BigNumber = require('bignumber.js');
@@ -9,11 +9,8 @@ class SolanaApi {
             throw new Error('HELIUS_RPC_URL is not set. Please check your environment variables.');
         }
         this.heliusUrl = process.env.HELIUS_RPC_URL;
-        this.requestTimeout = 60000; // Increased to 60 seconds
-        this.maxRetries = 5; // Increased retries
-        this.retryDelay = 2000; // Increased base delay
+        this.requestTimeout = 15000; // 15 seconds only
         
-        // Add connection pooling and keep-alive
         this.axiosInstance = axios.create({
             timeout: this.requestTimeout,
             headers: {
@@ -21,7 +18,6 @@ class SolanaApi {
                 'Connection': 'keep-alive',
                 'Keep-Alive': 'timeout=30, max=100'
             },
-            // Add connection reuse
             httpAgent: new (require('http')).Agent({ 
                 keepAlive: true,
                 maxSockets: 10
@@ -33,6 +29,7 @@ class SolanaApi {
         });
     }
 
+    // SIMPLE: Single call, no retries
     async callHelius(method, params, apiType = 'rpc') {
         const requestData = {
             jsonrpc: '2.0',
@@ -41,54 +38,25 @@ class SolanaApi {
             params: params
         };
 
-        for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-            try {
-                const response = await this.axiosInstance.post(this.heliusUrl, requestData);
+        try {
+            const response = await this.axiosInstance.post(this.heliusUrl, requestData);
 
-                if (response.data.error) {
-                    logger.error(`Helius RPC Error for ${method}:`, response.data.error);
-                    throw new Error(`RPC Error: ${response.data.error.message}`);
-                }
-
-                if (response.data.result === undefined) {
-                    logger.warn(`No result in response for ${method}`);
-                    return null;
-                }
-
-                return response.data.result;
-
-            } catch (error) {
-                const isNetworkError = error.code === 'ETIMEDOUT' || 
-                                     error.code === 'ENETUNREACH' || 
-                                     error.code === 'ECONNRESET' ||
-                                     error.code === 'ECONNREFUSED';
-                
-                logger.warn(`Helius API call attempt ${attempt}/${this.maxRetries} failed for ${method}:`, {
-                    error: error.message,
-                    code: error.code,
-                    isNetworkError
-                });
-                
-                if (attempt === this.maxRetries) {
-                    logger.error(`All attempts failed for Helius method ${method} after ${this.maxRetries} tries`);
-                    
-                    // For network errors, return null instead of throwing
-                    if (isNetworkError) {
-                        logger.warn(`Network error for ${method}, returning null to allow graceful degradation`);
-                        return null;
-                    }
-                    
-                    throw error;
-                }
-                
-                // Exponential backoff with jitter for network errors
-                const delay = isNetworkError ? 
-                    this.retryDelay * Math.pow(2, attempt - 1) + Math.random() * 1000 :
-                    this.retryDelay * attempt;
-                
-                logger.info(`Retrying ${method} in ${Math.round(delay)}ms...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
+            if (response.data.error) {
+                logger.error(`Helius RPC Error for ${method}:`, response.data.error);
+                return null; // Return null instead of throwing
             }
+
+            if (response.data.result === undefined) {
+                logger.warn(`No result in response for ${method}`);
+                return null;
+            }
+
+            return response.data.result;
+
+        } catch (error) {
+            // NO RETRIES - just log and return null
+            logger.warn(`Helius API call failed for ${method}:`, error.message);
+            return null;
         }
     }
 
@@ -101,7 +69,6 @@ class SolanaApi {
                 }
             }, 'api');
 
-            // Handle null result gracefully
             if (!result) {
                 logger.warn(`No asset data returned for ${tokenAddress}, using fallback`);
                 return this.createFallbackTokenData(tokenAddress);
@@ -112,7 +79,6 @@ class SolanaApi {
                 return this.createFallbackTokenData(tokenAddress);
             }
 
-            // Process the token data
             let adjustedSupply;
             try {
                 const rawSupply = new BigNumber(result.token_info.supply || 0);
@@ -129,7 +95,7 @@ class SolanaApi {
                 }
             } catch (error) {
                 logger.error(`Error calculating supply for ${tokenAddress}:`, error);
-                adjustedSupply = new BigNumber(1000000000); // Default to 1B
+                adjustedSupply = new BigNumber(1000000000);
             }
 
             const tokenData = {
@@ -147,20 +113,18 @@ class SolanaApi {
 
         } catch (error) {
             logger.error(`Error fetching asset info for ${tokenAddress}:`, error);
-            // Return fallback data instead of null
             return this.createFallbackTokenData(tokenAddress);
         }
     }
 
-    // Create fallback token data when API fails
     createFallbackTokenData(tokenAddress) {
         return {
             address: tokenAddress,
-            decimals: 6, // PumpFun standard
+            decimals: 6,
             symbol: 'Unknown',
             name: 'Unknown Token',
             supply: {
-                total: '1000000000' // Default 1B supply
+                total: '1000000000'
             },
             price: 0
         };
@@ -169,13 +133,7 @@ class SolanaApi {
     async getTokenLargestAccounts(tokenAddress) {
         try {
             const result = await this.callHelius('getTokenLargestAccounts', [tokenAddress]);
-            
-            if (!result) {
-                logger.debug(`No largest accounts found for token ${tokenAddress}`);
-                return null;
-            }
-            
-            return result;
+            return result; // null if failed
         } catch (error) {
             logger.error(`Error getting largest token accounts for ${tokenAddress}:`, error);
             return null;
@@ -185,13 +143,7 @@ class SolanaApi {
     async getBalance(address) {
         try {
             const result = await this.callHelius('getBalance', [address]);
-            
-            if (!result || result.value === undefined) {
-                logger.debug(`No balance found for address: ${address}`);
-                return { value: 0 };
-            }
-            
-            return result;
+            return result || { value: 0 };
         } catch (error) {
             logger.error(`Error getting balance for ${address}:`, error);
             return { value: 0 };
@@ -210,13 +162,7 @@ class SolanaApi {
             }
             
             const result = await this.callHelius('getTokenAccounts', params);
-            
-            if (!result) {
-                logger.debug(`No token accounts found for ${tokenAddress}`);
-                return { token_accounts: [], cursor: null };
-            }
-            
-            return result;
+            return result || { token_accounts: [], cursor: null };
         } catch (error) {
             logger.error(`Error getting token accounts for ${tokenAddress}:`, error);
             return { token_accounts: [], cursor: null };
@@ -228,11 +174,9 @@ class SolanaApi {
             const result = await this.callHelius('getTokenSupply', [tokenAddress]);
             
             if (!result || result.value === undefined) {
-                logger.error(`Unexpected result for getTokenSupply of token ${tokenAddress}:`, result);
-                // Return fallback supply info
                 return {
                     value: {
-                        amount: '1000000000000000', // 1B with 6 decimals
+                        amount: '1000000000000000',
                         decimals: 6,
                         uiAmount: 1000000000,
                         uiAmountString: '1000000000'
@@ -243,10 +187,9 @@ class SolanaApi {
             return result;
         } catch (error) {
             logger.error(`Error getting token supply for ${tokenAddress}:`, error);
-            // Return fallback supply info
             return {
                 value: {
-                    amount: '1000000000000000', // 1B with 6 decimals  
+                    amount: '1000000000000000',
                     decimals: 6,
                     uiAmount: 1000000000,
                     uiAmountString: '1000000000'
@@ -258,13 +201,7 @@ class SolanaApi {
     async getAccountInfo(address, config = { encoding: 'jsonParsed' }) {
         try {
             const response = await this.callHelius('getAccountInfo', [address, config]);
-            
-            if (!response || response.value === undefined) {
-                logger.debug(`No account info found for address: ${address}`);
-                return null;
-            }
-            
-            return response;
+            return response; // null if failed
         } catch (error) {
             logger.error(`Error getting account info for ${address}:`, error);
             return null;
@@ -282,13 +219,7 @@ class SolanaApi {
             ];
 
             const result = await this.callHelius('getTokenAccountsByOwner', params);
-            
-            if (!result || !result.value) {
-                logger.debug(`No token accounts found for owner ${ownerAddress} and mint ${tokenMintAddress}`);
-                return [];
-            }
-            
-            return result.value;
+            return result?.value || [];
         } catch (error) {
             logger.error(`Error getting token accounts for owner ${ownerAddress}:`, error);
             return [];
@@ -303,13 +234,7 @@ class SolanaApi {
             };
 
             const result = await this.callHelius('getSignaturesForAddress', [address, defaultOptions]);
-            
-            if (!Array.isArray(result)) {
-                logger.warn(`Expected array for getSignaturesForAddress, got:`, typeof result);
-                return [];
-            }
-            
-            return result;
+            return Array.isArray(result) ? result : [];
         } catch (error) {
             logger.error(`Error getting signatures for address ${address}:`, error);
             return [];
@@ -319,20 +244,13 @@ class SolanaApi {
     async getTransaction(signature, options = { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }) {
         try {
             const result = await this.callHelius('getTransaction', [signature, options]);
-            
-            if (!result) {
-                logger.debug(`No transaction details found for signature ${signature}`);
-                return null;
-            }
-            
-            return result;
+            return result; // null if failed
         } catch (error) {
             logger.error(`Error getting transaction ${signature}:`, error);
             return null;
         }
     }
 
-    // Health check method
     async healthCheck() {
         try {
             const result = await this.callHelius('getHealth');
@@ -343,7 +261,6 @@ class SolanaApi {
         }
     }
 
-    // Get version info
     async getVersion() {
         try {
             return await this.callHelius('getVersion');
@@ -353,16 +270,13 @@ class SolanaApi {
         }
     }
 
-    // Add cleanup method
     destroy() {
-        // Clean up any remaining connections
         if (this.axiosInstance) {
             this.axiosInstance = null;
         }
     }
 }
 
-// Factory function to create instance
 const getSolanaApi = () => new SolanaApi();
 
 module.exports = { getSolanaApi };

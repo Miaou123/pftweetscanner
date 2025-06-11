@@ -1,483 +1,331 @@
-// Updated AnalysisOrchestrator with simplified config
-const path = require('path');
+// src/publishers/telegramPublisher.js - Complete Telegram publisher implementation
+const TelegramBot = require('node-telegram-bot-api');
 const logger = require('../utils/logger');
-const BundleAnalyzer = require('../analysis/bundleAnalyzer');
-const TopHoldersAnalyzer = require('../analysis/topHoldersAnalyzer');
-const TelegramPublisher = require('../publishers/telegramPublisher');
-const JsonLogger = require('../services/jsonLogger');
-const config = require('../config'); // FIXED: Use simplified config
+const { formatNumber, formatPercentage, formatAddress, formatRiskLevel, escapeHtml } = require('../utils/formatters');
 
-class AnalysisOrchestrator {
+class TelegramPublisher {
     constructor(config = {}) {
-        // Determine bot type from config
-        this.botType = config.botType || 'creation'; // 'creation' or 'migration'
-        
         this.config = {
-            analysisTimeout: config.analysisTimeout || 5 * 60 * 1000,
-            publishResults: config.publishResults !== false,
-            saveToJson: config.saveToJson !== false, // Enable JSON logging by default
+            botToken: config.botToken || process.env.TELEGRAM_BOT_TOKEN,
+            channels: config.channels || [],
+            timeout: config.timeout || 30000,
+            retryAttempts: config.retryAttempts || 3,
+            retryDelay: config.retryDelay || 2000,
+            maxMessageLength: config.maxMessageLength || 4000,
             ...config
         };
 
-        // Get bot-specific enabled analyses from simplified config
-        const botSpecificConfig = require('../config').getConfigForBot(this.botType);
-        this.config.enabledAnalyses = botSpecificConfig.enabledAnalyses;
-        this.config.maxConcurrentAnalyses = botSpecificConfig.maxConcurrent;
-
-        logger.info(`🔬 AnalysisOrchestrator initialized for ${this.botType} bot`);
-        logger.info(`📋 Enabled analyses: ${this.config.enabledAnalyses.join(', ')}`);
-
-        this.bundleAnalyzer = BundleAnalyzer;
-        this.topHoldersAnalyzer = new TopHoldersAnalyzer();
-        this.telegramPublisher = new TelegramPublisher(config.telegram || {});
-        
-        // Initialize JSON logger
-        this.jsonLogger = new JsonLogger({
-            logsDirectory: config.jsonLogsDirectory || path.join(process.cwd(), 'scan_results'),
-            rotateDaily: config.rotateDailyLogs !== false
-        });
-        
-        // Analysis state
-        this.activeAnalyses = new Map();
-        this.completedAnalyses = new Map();
-    }
-
-    async analyzeToken(tokenData) {
-        const { tokenAddress, tokenInfo, twitterMetrics, operationId, timer } = tokenData;
-        
-        logger.info(`🔬 [${operationId}] Starting comprehensive analysis for ${tokenInfo.symbol} (${tokenAddress})`);
-        logger.info(`🔬 [${operationId}] Bot type: ${this.botType}, Enabled analyses: ${this.config.enabledAnalyses.join(', ')}`);
-        
-        const analysisResult = {
-            tokenAddress,
-            tokenInfo,
-            twitterMetrics,
-            operationId,
-            startTime: Date.now(),
-            success: false,
-            analyses: {},
-            errors: [],
-            summary: {},
-            timer: timer
+        this.bot = null;
+        this.isInitialized = false;
+        this.stats = {
+            messagesSent: 0,
+            messagesSuccessful: 0,
+            messagesFailed: 0,
+            channelsConfigured: this.config.channels.length
         };
 
-        // Create cancellation token for timeout handling
-        const cancellationToken = this.createCancellationToken(this.config.analysisTimeout);
-        this.activeAnalyses.set(operationId, cancellationToken);
+        this.initialize();
+    }
 
+    initialize() {
         try {
-            const analysisPromises = [];
-
-            // Run analyses based on what's enabled for this bot type
-            if (this.config.enabledAnalyses.includes('bundle')) {
-                logger.info(`🔬 [${operationId}] Starting bundle analysis (parallel)`);
-                analysisPromises.push(
-                    this.runAnalysisWithTimeout(
-                        'bundle',
-                        () => this.bundleAnalyzer.analyzeBundle(tokenAddress, 50000),
-                        operationId,
-                        cancellationToken
-                    )
-                );
-            } else {
-                logger.debug(`🔬 [${operationId}] Bundle analysis disabled for ${this.botType} bot`);
+            if (!this.config.botToken) {
+                logger.warn('No Telegram bot token provided - Telegram publishing disabled');
+                return;
             }
 
-            if (this.config.enabledAnalyses.includes('topHolders')) {
-                logger.info(`🔬 [${operationId}] Starting top holders analysis (parallel)`);
-                analysisPromises.push(
-                    this.runAnalysisWithTimeout(
-                        'topHolders',
-                        () => this.topHoldersAnalyzer.analyzeTopHolders(tokenAddress, 20),
-                        operationId,
-                        cancellationToken
-                    )
-                );
-            } else {
-                logger.debug(`🔬 [${operationId}] Top holders analysis disabled for ${this.botType} bot`);
+            if (this.config.channels.length === 0) {
+                logger.warn('No Telegram channels configured - Telegram publishing disabled');
+                return;
             }
 
-            if (analysisPromises.length === 0) {
-                logger.warn(`🔬 [${operationId}] No analyses enabled for ${this.botType} bot!`);
-                throw new Error(`No analyses enabled for ${this.botType} bot`);
-            }
-
-            // Wait for ALL analyses to complete in parallel
-            logger.info(`🔬 [${operationId}] Running ${analysisPromises.length} analyses in parallel...`);
-            const analysisResults = await Promise.allSettled(analysisPromises);
-            logger.info(`🔬 [${operationId}] All parallel analyses completed`);
-
-            // Process results
-            analysisResults.forEach((result, index) => {
-                const analysisType = this.config.enabledAnalyses.filter(type => 
-                    ['bundle', 'topHolders', 'devAnalysis'].includes(type)
-                )[index];
-                
-                if (result.status === 'fulfilled') {
-                    analysisResult.analyses[analysisType] = result.value;
-                    if (!result.value.success) {
-                        analysisResult.errors.push(`${analysisType}: ${result.value.error}`);
+            this.bot = new TelegramBot(this.config.botToken, {
+                polling: false,
+                request: {
+                    agentOptions: {
+                        keepAlive: true,
+                        family: 4
                     }
-                } else {
-                    analysisResult.analyses[analysisType] = {
-                        success: false,
-                        error: result.reason.message || 'Unknown error',
-                        type: analysisType
-                    };
-                    analysisResult.errors.push(`${analysisType}: ${result.reason.message || 'Unknown error'}`);
                 }
             });
-            
-            // Generate comprehensive summary
-            this.generateComprehensiveSummary(analysisResult);
 
-            // Determine overall success
-            const successfulAnalyses = Object.values(analysisResult.analyses)
-                .filter(analysis => analysis.success).length;
-
-            analysisResult.success = successfulAnalyses > 0;
-            analysisResult.endTime = Date.now();
-            analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
-
-            // Save to JSON file before publishing
-            if (this.config.saveToJson) {
-                await this.saveToJsonLog(analysisResult);
-            }
-
-            // Publish results to Telegram
-            if (this.config.publishResults) {
-                await this.publishResults(analysisResult);
-            }
-
-            if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Comprehensive analysis completed successfully in ${analysisResult.duration}ms`);
-                logger.info(`📊 [${operationId}] Results: ${successfulAnalyses}/${Object.keys(analysisResult.analyses).length} analyses successful`);
-            } else {
-                logger.warn(`⚠️ [${operationId}] All analyses failed - but notification sent`);
-            }
-
-            return analysisResult;
+            this.isInitialized = true;
+            logger.info(`📱 TelegramPublisher initialized with ${this.config.channels.length} channels`);
 
         } catch (error) {
-            logger.error(`❌ [${operationId}] Analysis orchestration failed:`, error);
-            analysisResult.error = error.message;
-            analysisResult.endTime = Date.now();
-            analysisResult.duration = analysisResult.endTime - analysisResult.startTime;
-            
-            // Save failed analysis to JSON as well
-            if (this.config.saveToJson) {
-                await this.saveToJsonLog(analysisResult);
-            }
-            
-            return analysisResult;
-        } finally {
-            this.activeAnalyses.delete(operationId);
-            this.completedAnalyses.set(operationId, analysisResult);
-            
-            // Clean up old completed analyses
-            this.cleanupCompletedAnalyses();
+            logger.error('Failed to initialize TelegramPublisher:', error);
+            this.isInitialized = false;
         }
     }
 
-    /**
-     * Save analysis result to JSON log - only basics
-     */
-    async saveToJsonLog(analysisResult) {
+    async publishAnalysis(analysisResult) {
+        if (!this.isInitialized) {
+            logger.warn('TelegramPublisher not initialized, skipping publish');
+            return false;
+        }
+
         try {
-            await this.jsonLogger.saveScanResult(analysisResult);
+            const message = this.formatAnalysisMessage(analysisResult);
+            return await this.sendToAllChannels(message);
         } catch (error) {
-            // Silent fail to avoid log spam
+            logger.error('Error publishing analysis to Telegram:', error);
+            this.stats.messagesFailed++;
+            return false;
         }
     }
 
-    /**
-     * Get JSON logging statistics
-     */
-    async getJsonLogStats() {
-        try {
-            return await this.jsonLogger.getStats();
-        } catch (error) {
-            logger.error('Error getting JSON log stats:', error);
-            return { totalFiles: 0, creationFiles: 0, migrationFiles: 0, files: [] };
+    formatAnalysisMessage(analysisResult) {
+        const { tokenInfo, twitterMetrics, summary, operationId, timer } = analysisResult;
+        
+        // Determine event type emoji and title
+        const eventType = tokenInfo.eventType || 'creation';
+        const eventEmoji = eventType === 'migration' ? '🔄' : '🆕';
+        const eventTitle = eventType === 'migration' ? 'MIGRATION DETECTED' : 'NEW TOKEN ALERT';
+        
+        // Header
+        let message = `${eventEmoji} **${eventTitle}**\n\n`;
+        
+        // Token Info
+        message += `🪙 **${escapeHtml(tokenInfo.name || 'Unknown')}** (${escapeHtml(tokenInfo.symbol || 'Unknown')})\n`;
+        message += `📍 Address: \`${formatAddress(tokenInfo.address || tokenInfo.mint, 8, 8)}\`\n\n`;
+        
+        // Twitter Metrics
+        if (twitterMetrics && (twitterMetrics.likes > 0 || twitterMetrics.views > 0)) {
+            message += `📱 **Twitter Engagement:**\n`;
+            if (twitterMetrics.likes > 0) {
+                message += `❤️ Likes: ${formatNumber(twitterMetrics.likes)}\n`;
+            }
+            if (twitterMetrics.views > 0) {
+                message += `👀 Views: ${formatNumber(twitterMetrics.views)}\n`;
+            }
+            if (twitterMetrics.link) {
+                message += `🔗 [View Tweet](${twitterMetrics.link})\n`;
+            }
+            message += '\n';
         }
-    }
-
-    /**
-     * Read scan results from JSON logs
-     */
-    async readScanResults(eventType, date = null) {
-        try {
-            return await this.jsonLogger.readScanResults(eventType, date);
-        } catch (error) {
-            logger.error('Error reading scan results:', error);
-            return [];
+        
+        // Analysis Results
+        if (summary) {
+            message += this.formatAnalysisResults(summary, analysisResult.analyses);
+        } else {
+            message += '⚠️ Analysis failed - Token too new for indexing\n\n';
         }
+        
+        // Processing Info
+        if (timer) {
+            message += `⏱️ Processed in ${timer.getElapsedSeconds()}s`;
+        }
+        if (operationId) {
+            message += ` | ID: \`${operationId.substring(0, 8)}\``;
+        }
+        
+        return message;
     }
 
-    // Keep all your existing methods unchanged...
-    getEnabledAnalyses() {
-        return this.config.enabledAnalyses || [];
+    formatAnalysisResults(summary, analyses) {
+        let message = '';
+        
+        // Risk Assessment
+        if (summary.riskLevel && summary.overallScore !== undefined) {
+            const riskEmoji = this.getRiskEmoji(summary.riskLevel);
+            message += `🎯 **Risk Assessment:** ${riskEmoji} ${summary.riskLevel}`;
+            if (summary.overallScore > 0) {
+                message += ` (${summary.overallScore}/100)`;
+            }
+            message += '\n\n';
+        }
+        
+        // Flags and Alerts
+        if (summary.flags && summary.flags.length > 0) {
+            message += `🚩 **Analysis Flags:**\n`;
+            summary.flags.forEach(flag => {
+                message += `${flag}\n`;
+            });
+            message += '\n';
+        }
+        
+        // Bundle Analysis
+        if (analyses?.bundle?.success && analyses.bundle.result) {
+            const bundle = analyses.bundle.result;
+            if (bundle.bundleDetected) {
+                message += `📦 **Bundle Analysis:**\n`;
+                message += `• Bundle detected: ${formatPercentage(bundle.percentageBundled)}% of supply\n`;
+                if (bundle.totalHoldingAmountPercentage) {
+                    message += `• Current holdings: ${formatPercentage(bundle.totalHoldingAmountPercentage)}%\n`;
+                }
+                message += `• Bundles found: ${bundle.bundles?.length || 0}\n\n`;
+            }
+        }
+        
+        // Top Holders Analysis
+        if (analyses?.topHolders?.success && analyses.topHolders.result?.summary) {
+            const holders = analyses.topHolders.result.summary;
+            message += `👥 **Top Holders Analysis:**\n`;
+            if (holders.whaleCount > 0) {
+                message += `🐋 Whales: ${holders.whaleCount}/20\n`;
+            }
+            if (holders.freshWalletCount > 0) {
+                message += `🆕 Fresh wallets: ${holders.freshWalletCount}/20\n`;
+            }
+            if (holders.concentration?.top5Percentage) {
+                message += `📊 Top 5 concentration: ${holders.concentration.top5Percentage}%\n`;
+            }
+            message += '\n';
+        }
+        
+        return message;
     }
 
-    getConfig() {
-        return {
-            enabledAnalyses: this.config.enabledAnalyses,
-            analysisTimeout: this.config.analysisTimeout,
-            publishResults: this.config.publishResults,
-            saveToJson: this.config.saveToJson,
-            maxConcurrentAnalyses: this.config.maxConcurrentAnalyses || 3,
-            botType: this.botType
+    getRiskEmoji(riskLevel) {
+        const riskEmojis = {
+            'LOW': '🟢',
+            'MEDIUM': '🟡',
+            'HIGH': '🟠',
+            'VERY_HIGH': '🔴',
+            'UNKNOWN': '⚪'
         };
+        return riskEmojis[riskLevel] || '⚪';
     }
 
-    async runAnalysisWithTimeout(analysisType, analysisFunction, operationId, cancellationToken) {
-        const startTime = Date.now();
-        logger.debug(`[${operationId}] Starting ${analysisType} analysis`);
+    async sendToAllChannels(message) {
+        if (!this.isInitialized || this.config.channels.length === 0) {
+            return false;
+        }
+
+        const promises = this.config.channels.map(channel => 
+            this.sendToChannel(channel, message)
+        );
 
         try {
-            const timeoutPromise = new Promise((_, reject) => {
-                const timeoutId = setTimeout(() => {
-                    reject(new Error(`${analysisType} analysis timed out`));
-                }, this.config.analysisTimeout);
+            const results = await Promise.allSettled(promises);
+            const successful = results.filter(r => r.status === 'fulfilled').length;
+            const failed = results.filter(r => r.status === 'rejected').length;
 
-                cancellationToken.onCancel(() => {
-                    clearTimeout(timeoutId);
-                    reject(new Error(`${analysisType} analysis cancelled`));
-                });
+            this.stats.messagesSent++;
+            this.stats.messagesSuccessful += successful;
+            this.stats.messagesFailed += failed;
+
+            if (successful > 0) {
+                logger.info(`📤 Sent to ${successful}/${this.config.channels.length} Telegram channels`);
+                return true;
+            } else {
+                logger.error(`❌ Failed to send to all ${this.config.channels.length} Telegram channels`);
+                return false;
+            }
+
+        } catch (error) {
+            logger.error('Error sending to Telegram channels:', error);
+            this.stats.messagesFailed++;
+            return false;
+        }
+    }
+
+    async sendToChannel(channel, message, retryCount = 0) {
+        try {
+            // Ensure message isn't too long
+            const finalMessage = this.truncateMessage(message);
+
+            await this.bot.sendMessage(channel, finalMessage, {
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+                disable_notification: false
             });
 
-            const result = await Promise.race([
-                analysisFunction(),
-                timeoutPromise
-            ]);
-
-            const duration = Date.now() - startTime;
-            logger.debug(`[${operationId}] ${analysisType} analysis completed in ${duration}ms`);
-
-            return {
-                type: analysisType,
-                success: true,
-                result,
-                duration,
-                error: null
-            };
+            logger.debug(`✅ Message sent to channel ${channel}`);
+            return true;
 
         } catch (error) {
-            const duration = Date.now() - startTime;
-            logger.warn(`[${operationId}] ${analysisType} analysis failed after ${duration}ms:`, error.message);
+            logger.error(`❌ Failed to send to channel ${channel}:`, error.message);
 
-            return {
-                type: analysisType,
-                success: false,
-                result: null,
-                duration,
-                error: error.message
-            };
+            // Retry logic
+            if (retryCount < this.config.retryAttempts) {
+                logger.info(`🔄 Retrying send to ${channel} (${retryCount + 1}/${this.config.retryAttempts})`);
+                await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                return this.sendToChannel(channel, message, retryCount + 1);
+            }
+
+            throw error;
         }
     }
 
-    generateComprehensiveSummary(analysisResult) {
-        const bundleAnalysis = analysisResult.analyses.bundle;
-        const topHoldersAnalysis = analysisResult.analyses.topHolders;
-        
-        const summary = {
-            totalAnalyses: Object.keys(analysisResult.analyses).length,
-            successfulAnalyses: Object.values(analysisResult.analyses).filter(a => a.success).length,
-            failedAnalyses: Object.values(analysisResult.analyses).filter(a => !a.success).length,
-            flags: [],
-            scores: {},
-            alerts: [],
-            analysisError: false
-        };
-
-        if (summary.successfulAnalyses === 0) {
-            summary.analysisError = true;
-            summary.flags.push('⚠️ Analysis failed - Token too new for indexing');
-            summary.riskLevel = 'UNKNOWN';
-            summary.overallScore = 0;
-            analysisResult.summary = summary;
-            return;
+    truncateMessage(message) {
+        if (message.length <= this.config.maxMessageLength) {
+            return message;
         }
 
-        // Process Bundle Analysis Results
-        if (bundleAnalysis?.success && bundleAnalysis.result) {
-            const bundleResult = bundleAnalysis.result;
-            
-            if (bundleResult.bundleDetected) {
-                summary.flags.push(`🔴 Bundle detected: ${bundleResult.percentageBundled?.toFixed(2)}% of supply`);
-                summary.alerts.push({
-                    type: 'bundle',
-                    severity: 'high',
-                    message: `Bundle activity detected (${bundleResult.percentageBundled?.toFixed(2)}%)`
-                });
-            }
-            
-            summary.scores.bundle = bundleResult.bundleDetected ? 20 : 100;
-            summary.bundleData = {
-                detected: bundleResult.bundleDetected,
-                percentage: bundleResult.percentageBundled,
-                holdingPercentage: bundleResult.totalHoldingAmountPercentage,
-                bundleCount: bundleResult.bundles?.length || 0
-            };
-        } else if (bundleAnalysis && !bundleAnalysis.success) {
-            summary.flags.push('⚠️ Bundle analysis failed');
-        }
-
-        // Process Top Holders Analysis Results
-        if (topHoldersAnalysis?.success && topHoldersAnalysis.result && topHoldersAnalysis.result.summary) {
-            const holdersResult = topHoldersAnalysis.result;
-            const holdersSummary = holdersResult.summary;
-            
-            if (holdersSummary.whaleCount > 8) {
-                summary.flags.push(`🔴 High whale concentration: ${holdersSummary.whaleCount}/20 holders`);
-                summary.alerts.push({
-                    type: 'whales',
-                    severity: 'high',
-                    message: `High whale concentration (${holdersSummary.whaleCount}/20)`
-                });
-            } else if (holdersSummary.whaleCount > 5) {
-                summary.flags.push(`🟡 Moderate whale presence: ${holdersSummary.whaleCount}/20 holders`);
-            }
-
-            if (holdersSummary.freshWalletCount > 10) {
-                summary.flags.push(`🔴 High fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
-                summary.alerts.push({
-                    type: 'fresh_wallets',
-                    severity: 'high',
-                    message: `High fresh wallet count (${holdersSummary.freshWalletCount}/20)`
-                });
-            } else if (holdersSummary.freshWalletCount > 5) {
-                summary.flags.push(`🟡 Moderate fresh wallet count: ${holdersSummary.freshWalletCount}/20 holders`);
-            }
-
-            const top5Concentration = parseFloat(holdersSummary.concentration.top5Percentage);
-            if (top5Concentration > 80) {
-                summary.flags.push(`🔴 Very high concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
-                summary.alerts.push({
-                    type: 'concentration',
-                    severity: 'high',
-                    message: `Very high concentration (${top5Concentration.toFixed(1)}%)`
-                });
-            } else if (top5Concentration > 60) {
-                summary.flags.push(`🟡 High concentration: Top 5 hold ${top5Concentration.toFixed(1)}%`);
-            }
-
-            summary.scores.topHolders = holdersSummary.riskScore;
-            summary.holdersData = {
-                whaleCount: holdersSummary.whaleCount,
-                freshWalletCount: holdersSummary.freshWalletCount,
-                regularWalletCount: holdersSummary.regularWalletCount,
-                concentration: holdersSummary.concentration,
-                riskLevel: holdersSummary.riskLevel
-            };
-        } else if (topHoldersAnalysis && !topHoldersAnalysis.success) {
-            summary.flags.push('⚠️ Top holders analysis failed');
-        }
-
-        // Calculate overall score and risk level
-        const scores = Object.values(summary.scores).filter(score => typeof score === 'number');
-        summary.overallScore = scores.length > 0 ? 
-            Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length) : 0;
-        
-        summary.riskLevel = this.determineOverallRiskLevel(summary.overallScore, summary.alerts);
-
-        if (summary.flags.length === 0 && summary.successfulAnalyses > 0) {
-            summary.flags.push('✅ No major red flags detected');
-        }
-
-        analysisResult.summary = summary;
+        const truncated = message.substring(0, this.config.maxMessageLength - 20);
+        return truncated + '\n\n[Message truncated]';
     }
 
-    determineOverallRiskLevel(score, alerts) {
-        const highSeverityAlerts = alerts.filter(alert => alert.severity === 'high').length;
-        
-        if (highSeverityAlerts >= 2 || score < 40) return 'VERY_HIGH';
-        if (highSeverityAlerts >= 1 || score < 60) return 'HIGH';
-        if (score < 80) return 'MEDIUM';
-        return 'LOW';
-    }
+    async publishSimpleAlert(tokenInfo, alertMessage, priority = 'medium') {
+        if (!this.isInitialized) {
+            return false;
+        }
 
-    async publishResults(analysisResult) {
         try {
-            logger.info(`📤 [${analysisResult.operationId}] Publishing comprehensive analysis results`);
-            await this.telegramPublisher.publishAnalysis(analysisResult);
+            const priorityEmoji = priority === 'high' ? '🚨' : priority === 'medium' ? '⚠️' : 'ℹ️';
+            const message = `${priorityEmoji} **ALERT**\n\n${alertMessage}`;
+            
+            return await this.sendToAllChannels(message);
         } catch (error) {
-            logger.error(`Failed to publish results for ${analysisResult.operationId}:`, error);
+            logger.error('Error publishing simple alert:', error);
+            return false;
         }
     }
 
-    createCancellationToken(timeout) {
-        const token = {
-            cancelled: false,
-            callbacks: []
-        };
+    async testConnection() {
+        if (!this.isInitialized) {
+            return { success: false, error: 'Not initialized' };
+        }
 
-        token.cancel = () => {
-            token.cancelled = true;
-            token.callbacks.forEach(callback => callback());
-        };
-
-        token.isCancelled = () => token.cancelled;
-
-        token.onCancel = (callback) => {
-            if (token.cancelled) {
-                callback();
-            } else {
-                token.callbacks.push(callback);
-            }
-        };
-
-        setTimeout(() => {
-            if (!token.cancelled) {
-                logger.warn(`Analysis timed out after ${timeout}ms`);
-                token.cancel();
-            }
-        }, timeout);
-
-        return token;
-    }
-
-    cleanupCompletedAnalyses() {
-        if (this.completedAnalyses.size > 100) {
-            const entries = Array.from(this.completedAnalyses.entries());
-            const toDelete = entries.slice(0, entries.length - 100);
-            
-            toDelete.forEach(([operationId]) => {
-                this.completedAnalyses.delete(operationId);
-            });
-
-            logger.debug(`Cleaned up ${toDelete.length} old analysis results`);
+        try {
+            const me = await this.bot.getMe();
+            logger.info(`✅ Telegram bot connected: @${me.username}`);
+            return { success: true, bot: me };
+        } catch (error) {
+            logger.error('❌ Telegram connection test failed:', error);
+            return { success: false, error: error.message };
         }
     }
 
     getStatus() {
         return {
-            botType: this.botType,
-            activeAnalyses: this.activeAnalyses.size,
-            completedAnalyses: this.completedAnalyses.size,
-            enabledAnalyses: this.config.enabledAnalyses,
-            jsonLogging: this.config.saveToJson,
-            config: {
-                analysisTimeout: this.config.analysisTimeout,
-                publishResults: this.config.publishResults,
-                maxConcurrentAnalyses: this.config.maxConcurrentAnalyses
-            }
+            isInitialized: this.isInitialized,
+            channelsConfigured: this.config.channels.length,
+            botTokenConfigured: !!this.config.botToken,
+            stats: this.stats
         };
     }
 
-    getAnalysisResult(operationId) {
-        return this.completedAnalyses.get(operationId);
+    getStatsString() {
+        const { messagesSent, messagesSuccessful, messagesFailed, channelsConfigured } = this.stats;
+        const successRate = messagesSent > 0 ? ((messagesSuccessful / messagesSent) * 100).toFixed(1) : '0';
+        
+        return `📱 Telegram Stats: ${messagesSent} sent | ${messagesSuccessful} successful | ${messagesFailed} failed | ${channelsConfigured} channels | ${successRate}% success rate`;
     }
 
-    cancelAnalysis(operationId) {
-        const cancellationToken = this.activeAnalyses.get(operationId);
-        if (cancellationToken) {
-            cancellationToken.cancel();
-            logger.info(`Cancelled analysis ${operationId}`);
-            return true;
+    resetStats() {
+        this.stats = {
+            messagesSent: 0,
+            messagesSuccessful: 0,
+            messagesFailed: 0,
+            channelsConfigured: this.config.channels.length
+        };
+        logger.info('Telegram statistics reset');
+    }
+
+    async cleanup() {
+        if (this.bot) {
+            try {
+                // Note: polling is disabled, so no need to stop polling
+                this.bot = null;
+                this.isInitialized = false;
+                logger.info('📱 TelegramPublisher cleaned up');
+            } catch (error) {
+                logger.error('Error during TelegramPublisher cleanup:', error);
+            }
         }
-        return false;
     }
 }
 
-module.exports = AnalysisOrchestrator;
+module.exports = TelegramPublisher;

@@ -1,4 +1,4 @@
-// src/publishers/telegramPublisher.js - Complete Telegram publisher implementation
+// src/publishers/telegramPublisher.js - CLEAN UI FORMAT like your old design
 const TelegramBot = require('node-telegram-bot-api');
 const logger = require('../utils/logger');
 const { formatNumber, formatPercentage, formatAddress, formatRiskLevel, escapeHtml } = require('../utils/formatters');
@@ -75,116 +75,179 @@ class TelegramPublisher {
     }
 
     formatAnalysisMessage(analysisResult) {
-        const { tokenInfo, twitterMetrics, summary, operationId, timer } = analysisResult;
+        const { tokenInfo, twitterMetrics, summary, operationId, timer, analyses } = analysisResult;
         
-        // Determine event type emoji and title
+        // Event type
         const eventType = tokenInfo.eventType || 'creation';
         const eventEmoji = eventType === 'migration' ? '🔄' : '🆕';
-        const eventTitle = eventType === 'migration' ? 'MIGRATION DETECTED' : 'NEW TOKEN ALERT';
+        const eventTitle = eventType === 'migration' ? 'MIGRATION' : 'NEW TOKEN';
         
-        // Header
-        let message = `${eventEmoji} **${eventTitle}**\n\n`;
+        // Build message in your clean format
+        let message = `${eventEmoji} ${eventTitle} | ${escapeHtml(tokenInfo.symbol || 'Unknown')}\n`;
+        message += `${escapeHtml(tokenInfo.name || 'Unknown Token')}\n`;
+        // Make address clickable/copiable with monospace formatting
+        message += `\`${tokenInfo.address || tokenInfo.mint || 'Unknown'}\`\n\n`;
         
-        // Token Info
-        message += `🪙 **${escapeHtml(tokenInfo.name || 'Unknown')}** (${escapeHtml(tokenInfo.symbol || 'Unknown')})\n`;
-        message += `📍 Address: \`${formatAddress(tokenInfo.address || tokenInfo.mint, 8, 8)}\`\n\n`;
-        
-        // Twitter Metrics
+        // Twitter metrics in compact format
         if (twitterMetrics && (twitterMetrics.likes > 0 || twitterMetrics.views > 0)) {
-            message += `📱 **Twitter Engagement:**\n`;
-            if (twitterMetrics.likes > 0) {
-                message += `❤️ Likes: ${formatNumber(twitterMetrics.likes)}\n`;
+            const parts = [];
+            if (twitterMetrics.views > 0) parts.push(`👀 ${formatNumber(twitterMetrics.views)} views`);
+            if (twitterMetrics.likes > 0) parts.push(`❤️ ${formatNumber(twitterMetrics.likes)} likes`);
+            
+            // Add time ago if available
+            if (twitterMetrics.publishedAt) {
+                const timeAgo = this.getTimeAgo(twitterMetrics.publishedAt);
+                if (timeAgo) parts.push(`📅 ${timeAgo}`);
             }
-            if (twitterMetrics.views > 0) {
-                message += `👀 Views: ${formatNumber(twitterMetrics.views)}\n`;
+            
+            if (parts.length > 0) {
+                message += `🐦 ${parts.join(' • ')}\n\n`;
             }
-            if (twitterMetrics.link) {
-                message += `🔗 [View Tweet](${twitterMetrics.link})\n`;
-            }
-            message += '\n';
         }
         
-        // Analysis Results
-        if (summary) {
-            message += this.formatAnalysisResults(summary, analysisResult.analyses);
-        } else {
-            message += '⚠️ Analysis failed - Token too new for indexing\n\n';
-        }
-        
-        // Processing Info
-        if (timer) {
-            message += `⏱️ Processed in ${timer.getElapsedSeconds()}s`;
-        }
-        if (operationId) {
-            message += ` | ID: \`${operationId.substring(0, 8)}\``;
-        }
-        
-        return message;
-    }
-
-    formatAnalysisResults(summary, analyses) {
-        let message = '';
-        
-        // Risk Assessment
-        if (summary.riskLevel && summary.overallScore !== undefined) {
-            const riskEmoji = this.getRiskEmoji(summary.riskLevel);
-            message += `🎯 **Risk Assessment:** ${riskEmoji} ${summary.riskLevel}`;
-            if (summary.overallScore > 0) {
-                message += ` (${summary.overallScore}/100)`;
-            }
-            message += '\n\n';
-        }
-        
-        // Flags and Alerts
-        if (summary.flags && summary.flags.length > 0) {
-            message += `🚩 **Analysis Flags:**\n`;
-            summary.flags.forEach(flag => {
-                message += `${flag}\n`;
-            });
-            message += '\n';
-        }
-        
-        // Bundle Analysis
+        // Bundle Analysis - Clean format
         if (analyses?.bundle?.success && analyses.bundle.result) {
             const bundle = analyses.bundle.result;
             if (bundle.bundleDetected) {
-                message += `📦 **Bundle Analysis:**\n`;
-                message += `• Bundle detected: ${formatPercentage(bundle.percentageBundled)}% of supply\n`;
-                if (bundle.totalHoldingAmountPercentage) {
-                    message += `• Current holdings: ${formatPercentage(bundle.totalHoldingAmountPercentage)}%\n`;
-                }
-                message += `• Bundles found: ${bundle.bundles?.length || 0}\n\n`;
+                message += `📦 Bundle Analysis:\n`;
+                message += `• Bundles Found: ${bundle.bundles?.length || 0}\n`;
+                
+                // Format tokens bundled
+                const tokensBundled = this.formatTokenAmount(bundle.totalTokensBundled);
+                const bundledPercent = this.safeFormatPercentage(bundle.percentageBundled);
+                message += `• Tokens Bundled: ${tokensBundled} (${bundledPercent}%)\n`;
+                
+                // Format currently held
+                const tokensHeld = this.formatTokenAmount(bundle.totalHoldingAmount);
+                const heldPercent = this.safeFormatPercentage(bundle.totalHoldingAmountPercentage);
+                message += `• Currently Held: ${tokensHeld} (${heldPercent}%)\n\n`;
             }
         }
         
-        // Top Holders Analysis
+        // Top Holders Analysis - Clean format
         if (analyses?.topHolders?.success && analyses.topHolders.result?.summary) {
             const holders = analyses.topHolders.result.summary;
-            message += `👥 **Top Holders Analysis:**\n`;
-            if (holders.whaleCount > 0) {
-                message += `🐋 Whales: ${holders.whaleCount}/20\n`;
+            message += `👥 Top Holders Analysis:\n`;
+            
+            // Whales
+            const whaleCount = holders.whaleCount || 0;
+            const whalePercent = this.safeParsePercentage(holders.whalePercentage);
+            message += `• 🐋 Whales: ${whaleCount}/20 (${whalePercent}%)\n`;
+            
+            // Fresh wallets
+            const freshCount = holders.freshWalletCount || 0;
+            const freshPercent = this.safeParsePercentage(holders.freshWalletPercentage);
+            message += `• 🆕 Fresh Wallets: ${freshCount}/20 (${freshPercent}%)\n`;
+            
+            // Top 10 concentration
+            if (holders.concentration?.top10Percentage) {
+                const top10Percent = this.safeParsePercentage(holders.concentration.top10Percentage);
+                message += `• Top 10 Holdings: ${top10Percent}%\n\n`;
             }
-            if (holders.freshWalletCount > 0) {
-                message += `🆕 Fresh wallets: ${holders.freshWalletCount}/20\n`;
-            }
-            if (holders.concentration?.top5Percentage) {
-                message += `📊 Top 5 concentration: ${holders.concentration.top5Percentage}%\n`;
-            }
-            message += '\n';
         }
+        
+        // Links section
+        message += `🔗 Links:\n`;
+        const tokenAddress = tokenInfo.address || tokenInfo.mint;
+        
+        const links = [];
+        if (twitterMetrics?.link) {
+            links.push(`🐦 [Tweet](${twitterMetrics.link})`);
+        }
+        if (tokenAddress) {
+            links.push(`📈 [DexScreener](https://dexscreener.com/solana/${tokenAddress})`);
+            links.push(`🔥 [Pump.fun](https://pump.fun/${tokenAddress})`);
+            links.push(`📊 [Solscan](https://solscan.io/token/${tokenAddress})`);
+        }
+        
+        if (links.length > 0) {
+            message += links.join(' | ') + '\n\n';
+        }
+        
+        // Analysis info
+        const duration = timer ? timer.getElapsedSeconds() : 'N/A';
+        message += `Analysis time: ${duration}s | ID: ${operationId || 'N/A'}`;
         
         return message;
     }
 
-    getRiskEmoji(riskLevel) {
-        const riskEmojis = {
-            'LOW': '🟢',
-            'MEDIUM': '🟡',
-            'HIGH': '🟠',
-            'VERY_HIGH': '🔴',
-            'UNKNOWN': '⚪'
-        };
-        return riskEmojis[riskLevel] || '⚪';
+    // Format token amounts with M/B suffixes
+    formatTokenAmount(amount) {
+        if (!amount || isNaN(amount)) return '0';
+        
+        const num = parseFloat(amount);
+        if (num >= 1000000000) {
+            return `${(num / 1000000000).toFixed(1)}B`;
+        }
+        if (num >= 1000000) {
+            return `${(num / 1000000).toFixed(1)}M`;
+        }
+        if (num >= 1000) {
+            return `${(num / 1000).toFixed(1)}K`;
+        }
+        return num.toFixed(0);
+    }
+
+    // Get time ago string
+    getTimeAgo(publishedAt) {
+        if (!publishedAt) return null;
+        
+        try {
+            const now = new Date();
+            const published = new Date(publishedAt);
+            const diffMs = now - published;
+            const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+            const diffMinutes = Math.floor(diffMs / (1000 * 60));
+            
+            if (diffHours >= 24) {
+                const days = Math.floor(diffHours / 24);
+                return `${days}d ago`;
+            } else if (diffHours >= 1) {
+                return `${diffHours}h ago`;
+            } else if (diffMinutes >= 1) {
+                return `${diffMinutes}m ago`;
+            } else {
+                return 'now';
+            }
+        } catch (error) {
+            return null;
+        }
+    }
+
+    // Safe percentage formatting that handles both strings and numbers
+    safeFormatPercentage(value) {
+        if (value === null || value === undefined) return '0.00';
+        
+        // If it's already a string, just return it
+        if (typeof value === 'string') {
+            return value;
+        }
+        
+        // If it's a number, format it
+        if (typeof value === 'number') {
+            return value.toFixed(2);
+        }
+        
+        // Fallback
+        return '0.00';
+    }
+
+    // Safe percentage parsing that handles both strings and numbers
+    safeParsePercentage(value) {
+        if (value === null || value === undefined) return '0.0';
+        
+        // If it's already a string, just return it (remove % if present)
+        if (typeof value === 'string') {
+            return value.replace('%', '');
+        }
+        
+        // If it's a number, format it
+        if (typeof value === 'number') {
+            return value.toFixed(1);
+        }
+        
+        // Fallback
+        return '0.0';
     }
 
     async sendToAllChannels(message) {

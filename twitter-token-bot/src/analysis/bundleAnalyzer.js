@@ -178,7 +178,7 @@ class BundleAnalyzer {
 
         // Filter for actual bundles (multiple wallets in same slot)
         const filteredBundles = Object.values(bundles)
-            .filter(bundle => bundle.uniqueWallets.size >= 2)
+            .filter(bundle => bundle.uniqueWallets.size >= 3)
             .map(bundle => ({
                 ...bundle,
                 uniqueWalletsCount: bundle.uniqueWallets.size,

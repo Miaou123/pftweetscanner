@@ -1,4 +1,4 @@
-// src/publishers/telegramPublisher.js - CLEAN UI FORMAT like your old design
+// src/publishers/telegramPublisher.js - Add top 10 holdings filter
 const TelegramBot = require('node-telegram-bot-api');
 const logger = require('../utils/logger');
 const { formatNumber, formatPercentage, formatAddress, formatRiskLevel, escapeHtml } = require('../utils/formatters');
@@ -12,6 +12,11 @@ class TelegramPublisher {
             retryAttempts: config.retryAttempts || 3,
             retryDelay: config.retryDelay || 2000,
             maxMessageLength: config.maxMessageLength || 4000,
+            
+            // 🚀 NEW: Top 10 holdings filter
+            maxTop10Holdings: config.maxTop10Holdings || parseFloat(process.env.MAX_TOP10_HOLDINGS) || 70.0,
+            enableTop10Filter: config.enableTop10Filter !== false, // Enabled by default
+            
             ...config
         };
 
@@ -21,6 +26,7 @@ class TelegramPublisher {
             messagesSent: 0,
             messagesSuccessful: 0,
             messagesFailed: 0,
+            messagesFiltered: 0, // 🚀 NEW: Track filtered messages
             channelsConfigured: this.config.channels.length
         };
 
@@ -51,6 +57,13 @@ class TelegramPublisher {
 
             this.isInitialized = true;
             logger.info(`📱 TelegramPublisher initialized with ${this.config.channels.length} channels`);
+            
+            // 🚀 NEW: Log filter settings
+            if (this.config.enableTop10Filter) {
+                logger.info(`🔒 Top 10 holdings filter enabled: Max ${this.config.maxTop10Holdings}%`);
+            } else {
+                logger.info(`🔓 Top 10 holdings filter disabled`);
+            }
 
         } catch (error) {
             logger.error('Failed to initialize TelegramPublisher:', error);
@@ -65,13 +78,58 @@ class TelegramPublisher {
         }
 
         try {
+            // 🚀 NEW: Check top 10 holdings filter
+            if (this.config.enableTop10Filter && this.shouldFilterByTop10Holdings(analysisResult)) {
+                const { tokenInfo, analyses } = analysisResult;
+                const top10Percent = this.getTop10HoldingsPercent(analyses);
+                
+                logger.info(`🔒 FILTERED: ${tokenInfo.symbol} - Top 10 holdings ${top10Percent.toFixed(1)}% > ${this.config.maxTop10Holdings}% threshold`);
+                
+                this.stats.messagesFiltered++;
+                return false; // Don't send to Telegram
+            }
+
             const message = this.formatAnalysisMessage(analysisResult);
             return await this.sendToAllChannels(message);
+            
         } catch (error) {
             logger.error('Error publishing analysis to Telegram:', error);
             this.stats.messagesFailed++;
             return false;
         }
+    }
+
+    // 🚀 NEW: Check if token should be filtered based on top 10 holdings
+    shouldFilterByTop10Holdings(analysisResult) {
+        if (!this.config.enableTop10Filter) {
+            return false; // Filter disabled
+        }
+
+        const top10Percent = this.getTop10HoldingsPercent(analysisResult.analyses);
+        
+        if (top10Percent === null) {
+            // No top holders data available - don't filter
+            return false;
+        }
+
+        return top10Percent > this.config.maxTop10Holdings;
+    }
+
+    // 🚀 NEW: Extract top 10 holdings percentage from analysis
+    getTop10HoldingsPercent(analyses) {
+        // Check top holders analysis
+        if (analyses?.topHolders?.success && analyses.topHolders.result?.summary?.concentration?.top10Percentage) {
+            const top10Value = analyses.topHolders.result.summary.concentration.top10Percentage;
+            
+            // Handle both string and number formats
+            if (typeof top10Value === 'string') {
+                return parseFloat(top10Value.replace('%', ''));
+            } else if (typeof top10Value === 'number') {
+                return top10Value;
+            }
+        }
+
+        return null; // No data available
     }
 
     formatAnalysisMessage(analysisResult) {
@@ -171,7 +229,29 @@ class TelegramPublisher {
         return message;
     }
 
-    // Format token amounts with M/B suffixes
+    // ... rest of your existing methods stay the same ...
+
+    getStatus() {
+        return {
+            isInitialized: this.isInitialized,
+            channelsConfigured: this.config.channels.length,
+            botTokenConfigured: !!this.config.botToken,
+            filterSettings: {
+                enableTop10Filter: this.config.enableTop10Filter,
+                maxTop10Holdings: this.config.maxTop10Holdings
+            },
+            stats: this.stats
+        };
+    }
+
+    getStatsString() {
+        const { messagesSent, messagesSuccessful, messagesFailed, messagesFiltered, channelsConfigured } = this.stats;
+        const successRate = messagesSent > 0 ? ((messagesSuccessful / messagesSent) * 100).toFixed(1) : '0';
+        
+        return `📱 Telegram Stats: ${messagesSent} sent | ${messagesSuccessful} successful | ${messagesFailed} failed | ${messagesFiltered} filtered | ${channelsConfigured} channels | ${successRate}% success rate`;
+    }
+
+    // ... include all your other existing methods unchanged ...
     formatTokenAmount(amount) {
         if (!amount || isNaN(amount)) return '0';
         
@@ -188,7 +268,6 @@ class TelegramPublisher {
         return num.toFixed(0);
     }
 
-    // Get time ago string
     getTimeAgo(publishedAt) {
         if (!publishedAt) return null;
         
@@ -214,39 +293,31 @@ class TelegramPublisher {
         }
     }
 
-    // Safe percentage formatting that handles both strings and numbers
     safeFormatPercentage(value) {
         if (value === null || value === undefined) return '0.00';
         
-        // If it's already a string, just return it
         if (typeof value === 'string') {
             return value;
         }
         
-        // If it's a number, format it
         if (typeof value === 'number') {
             return value.toFixed(2);
         }
         
-        // Fallback
         return '0.00';
     }
 
-    // Safe percentage parsing that handles both strings and numbers
     safeParsePercentage(value) {
         if (value === null || value === undefined) return '0.0';
         
-        // If it's already a string, just return it (remove % if present)
         if (typeof value === 'string') {
             return value.replace('%', '');
         }
         
-        // If it's a number, format it
         if (typeof value === 'number') {
             return value.toFixed(1);
         }
         
-        // Fallback
         return '0.0';
     }
 
@@ -285,7 +356,6 @@ class TelegramPublisher {
 
     async sendToChannel(channel, message, retryCount = 0) {
         try {
-            // Ensure message isn't too long
             const finalMessage = this.truncateMessage(message);
 
             await this.bot.sendMessage(channel, finalMessage, {
@@ -300,7 +370,6 @@ class TelegramPublisher {
         } catch (error) {
             logger.error(`❌ Failed to send to channel ${channel}:`, error.message);
 
-            // Retry logic
             if (retryCount < this.config.retryAttempts) {
                 logger.info(`🔄 Retrying send to ${channel} (${retryCount + 1}/${this.config.retryAttempts})`);
                 await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
@@ -351,27 +420,12 @@ class TelegramPublisher {
         }
     }
 
-    getStatus() {
-        return {
-            isInitialized: this.isInitialized,
-            channelsConfigured: this.config.channels.length,
-            botTokenConfigured: !!this.config.botToken,
-            stats: this.stats
-        };
-    }
-
-    getStatsString() {
-        const { messagesSent, messagesSuccessful, messagesFailed, channelsConfigured } = this.stats;
-        const successRate = messagesSent > 0 ? ((messagesSuccessful / messagesSent) * 100).toFixed(1) : '0';
-        
-        return `📱 Telegram Stats: ${messagesSent} sent | ${messagesSuccessful} successful | ${messagesFailed} failed | ${channelsConfigured} channels | ${successRate}% success rate`;
-    }
-
     resetStats() {
         this.stats = {
             messagesSent: 0,
             messagesSuccessful: 0,
             messagesFailed: 0,
+            messagesFiltered: 0, // Reset filtered count too
             channelsConfigured: this.config.channels.length
         };
         logger.info('Telegram statistics reset');
@@ -380,7 +434,6 @@ class TelegramPublisher {
     async cleanup() {
         if (this.bot) {
             try {
-                // Note: polling is disabled, so no need to stop polling
                 this.bot = null;
                 this.isInitialized = false;
                 logger.info('📱 TelegramPublisher cleaned up');

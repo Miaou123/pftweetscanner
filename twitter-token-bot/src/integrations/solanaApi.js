@@ -1,4 +1,4 @@
-// src/integrations/solanaApi.js - SIMPLE FIX: Remove retries, single attempt only
+// src/integrations/solanaApi.js - Enhanced with single retry after 15 seconds
 const axios = require('axios');
 const logger = require('../utils/logger');
 const BigNumber = require('bignumber.js');
@@ -9,7 +9,8 @@ class SolanaApi {
             throw new Error('HELIUS_RPC_URL is not set. Please check your environment variables.');
         }
         this.heliusUrl = process.env.HELIUS_RPC_URL;
-        this.requestTimeout = 15000; // 15 seconds only
+        this.requestTimeout = 15000; // 15 seconds per attempt
+        this.retryDelay = 15000; // 15 seconds between retry
         
         this.axiosInstance = axios.create({
             timeout: this.requestTimeout,
@@ -29,8 +30,8 @@ class SolanaApi {
         });
     }
 
-    // SIMPLE: Single call, no retries
-    async callHelius(method, params, apiType = 'rpc') {
+    // Enhanced with single retry after 15 seconds
+    async callHelius(method, params, apiType = 'rpc', retryCount = 0) {
         const requestData = {
             jsonrpc: '2.0',
             id: 'helius-call',
@@ -41,25 +42,67 @@ class SolanaApi {
         try {
             const response = await this.axiosInstance.post(this.heliusUrl, requestData);
 
+            // Check for Helius API errors
             if (response.data.error) {
                 logger.error(`Helius RPC Error for ${method}:`, response.data.error);
-                return null; // Return null instead of throwing
+                
+                // Retry once if it's the first attempt and we got an API error
+                if (retryCount === 0) {
+                    logger.info(`${method} failed with API error, retrying in ${this.retryDelay / 1000}s...`);
+                    await this.sleep(this.retryDelay);
+                    return this.callHelius(method, params, apiType, 1);
+                }
+                
+                return null; // Return null after retry
             }
 
+            // Check for missing result
             if (response.data.result === undefined) {
                 logger.warn(`No result in response for ${method}`);
-                return null;
+                
+                // Retry once if it's the first attempt and we got no result
+                if (retryCount === 0) {
+                    logger.info(`${method} returned no result, retrying in ${this.retryDelay / 1000}s...`);
+                    await this.sleep(this.retryDelay);
+                    return this.callHelius(method, params, apiType, 1);
+                }
+                
+                return null; // Return null after retry
+            }
+
+            // Success - log if this was a retry
+            if (retryCount > 0) {
+                logger.info(`✅ ${method} succeeded on retry #${retryCount}`);
             }
 
             return response.data.result;
 
         } catch (error) {
-            // NO RETRIES - just log and return null
-            logger.warn(`Helius API call failed for ${method}:`, error.message);
+            // Handle network errors, timeouts, etc.
+            const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
+            const errorType = isTimeout ? 'timeout' : 'network error';
+            
+            logger.warn(`Helius API call failed for ${method} (${errorType}):`, error.message);
+            
+            // Retry once if it's the first attempt
+            if (retryCount === 0) {
+                logger.info(`${method} failed with ${errorType}, retrying in ${this.retryDelay / 1000}s...`);
+                await this.sleep(this.retryDelay);
+                return this.callHelius(method, params, apiType, 1);
+            }
+            
+            // Failed after retry
+            logger.error(`❌ ${method} failed after retry, giving up`);
             return null;
         }
     }
 
+    // Helper method for delays
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // Rest of your existing methods stay the same...
     async getAsset(tokenAddress) {
         try {
             const result = await this.callHelius('getAsset', {
@@ -133,7 +176,7 @@ class SolanaApi {
     async getTokenLargestAccounts(tokenAddress) {
         try {
             const result = await this.callHelius('getTokenLargestAccounts', [tokenAddress]);
-            return result; // null if failed
+            return result; // null if failed (after retry)
         } catch (error) {
             logger.error(`Error getting largest token accounts for ${tokenAddress}:`, error);
             return null;
@@ -201,7 +244,7 @@ class SolanaApi {
     async getAccountInfo(address, config = { encoding: 'jsonParsed' }) {
         try {
             const response = await this.callHelius('getAccountInfo', [address, config]);
-            return response; // null if failed
+            return response; // null if failed (after retry)
         } catch (error) {
             logger.error(`Error getting account info for ${address}:`, error);
             return null;
@@ -244,7 +287,7 @@ class SolanaApi {
     async getTransaction(signature, options = { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }) {
         try {
             const result = await this.callHelius('getTransaction', [signature, options]);
-            return result; // null if failed
+            return result; // null if failed (after retry)
         } catch (error) {
             logger.error(`Error getting transaction ${signature}:`, error);
             return null;

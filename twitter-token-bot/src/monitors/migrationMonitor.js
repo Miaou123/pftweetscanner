@@ -1,7 +1,7 @@
-// src/monitors/migrationMonitor.js - OPTIMIZED workflow with proper TwitterValidator usage
+// src/monitors/migrationMonitor.js - CORRECTED VERSION
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
-const TwitterValidator = require('../validators/twitterValidator');
+const SocialMediaManager = require('../validators/socialMediaManager');
 const AnalysisOrchestrator = require('../orchestrators/analysisOrchestrator');
 const TelegramPublisher = require('../publishers/telegramPublisher');
 const pumpfunApi = require('../integrations/pumpfunApi');
@@ -24,12 +24,13 @@ class MigrationMonitor extends EventEmitter {
 
         logger.info(`📋 MigrationMonitor Config:`);
         logger.info(`   • Min Twitter Likes: ${this.config.minTwitterLikes.toLocaleString()}`);
+        logger.info(`   • 🎵 TikTok Auto-Qualification: Enabled`);
         logger.info(`   • View Count Extraction: ${this.config.enableViewCountExtraction ? 'Enabled' : 'Disabled'}`);
 
-        // 🔥 SINGLE TwitterValidator instance handles ALL Twitter operations
-        this.twitterValidator = new TwitterValidator({
-            enablePageExtraction: this.config.enableViewCountExtraction,
-            timeout: this.config.viewCountTimeout,
+        // Use SocialMediaManager instead of TwitterValidator
+        this.socialMediaManager = new SocialMediaManager({
+            enableViewCountExtraction: this.config.enableViewCountExtraction,
+            viewCountTimeout: this.config.viewCountTimeout,
             quickTimeout: 5000
         });
         
@@ -46,12 +47,16 @@ class MigrationMonitor extends EventEmitter {
         this.processingQueue = [];
         this.currentlyAnalyzing = new Set();
         this.isProcessing = false;
+        
+        // Enhanced stats with TikTok tracking
         this.stats = {
             migrationsReceived: 0,
             migrationsProcessed: 0,
             analysesCompleted: 0,
             migrationsSkipped: 0,
-            twitterValidationFailed: 0,
+            tiktokAutoQualified: 0,
+            twitterQualified: 0,
+            socialMediaValidationFailed: 0, // ✅ FIXED: Consistent naming
             likesThresholdFailed: 0,
             viewCountsExtracted: 0,
             metadataFetchFailures: 0,
@@ -108,74 +113,115 @@ class MigrationMonitor extends EventEmitter {
 
             logger.info(`✅ Token metadata: ${tokenInfo.name} (${tokenInfo.symbol})`);
 
-            // 🔥 STEP 2: Use TwitterValidator to extract URL and check likes in ONE operation
-            logger.info(`⏱️ [${timer.operationId}] Step 2: Twitter validation (URL extraction + likes check)...`);
-            const twitterValidationStart = Date.now();
+            // STEP 2: Use SocialMediaManager for social validation
+            logger.info(`⏱️ [${timer.operationId}] Step 2: Social validation (TikTok/Twitter detection)...`);
+            const socialValidationStart = Date.now();
             
-            // Create a tokenEvent-like object for TwitterValidator
-            const tokenEventForTwitter = {
+            // Create a tokenEvent-like object for social extraction
+            const tokenEventForSocial = {
                 ...tokenInfo,
-                twitter: tokenInfo.twitter,
                 website: tokenInfo.website,
+                twitter: tokenInfo.twitter,
                 telegram: tokenInfo.telegram,
                 description: tokenInfo.description,
                 uri: tokenInfo.metadata_uri
             };
             
-            // 🔥 OPTIMIZED: TwitterValidator handles URL extraction AND likes check
-            const twitterUrl = await this.twitterValidator.extractTwitterUrl(tokenEventForTwitter);
+            // Use SocialMediaManager
+            const socialResult = await this.socialMediaManager.quickEngagementCheck(tokenEventForSocial);
             
-            if (!twitterUrl) {
-                const twitterTime = Date.now() - twitterValidationStart;
-                logger.info(`❌ [${timer.operationId}] No Twitter URL found in ${twitterTime}ms, skipping`);
+            if (!socialResult) {
+                const socialTime = Date.now() - socialValidationStart;
+                logger.info(`❌ [${timer.operationId}] No social URL found in ${socialTime}ms, skipping`);
                 this.stats.migrationsSkipped++;
                 return;
             }
 
-            // Immediate likes check
-            const quickMetrics = await this.twitterValidator.quickLikesCheck(twitterUrl);
-            const twitterValidationTime = Date.now() - twitterValidationStart;
+            const { url: socialUrl, platform, metrics: socialMetrics, autoQualified } = socialResult;
+            const socialValidationTime = Date.now() - socialValidationStart;
 
-            if (!quickMetrics || !quickMetrics.likes) {
-                logger.warn(`❌ [${timer.operationId}] Twitter validation failed in ${twitterValidationTime}ms`);
-                this.stats.twitterValidationFailed++;
-                this.stats.migrationsSkipped++;
+            // 🎵 TikTok Auto-Qualification Path
+            if (platform === 'tiktok') {
+                logger.info(`🎵 [${timer.operationId}] TikTok link detected in ${socialValidationTime}ms: ${socialUrl}`);
+                logger.info(`🚀 [${timer.operationId}] AUTO-QUALIFYING ${tokenInfo.symbol} - TikTok has viral potential!`);
+                
+                this.stats.tiktokAutoQualified++;
+                
+                // Create complete token event
+                const completeTokenEvent = {
+                    ...migrationEvent,
+                    eventType: 'migration',
+                    name: tokenInfo.name,
+                    symbol: tokenInfo.symbol,
+                    timer: timer,
+                    tokenInfo: tokenInfo
+                };
+
+                // Add to processing queue immediately
+                this.processingQueue.push({
+                    tokenEvent: completeTokenEvent,
+                    socialUrl,
+                    socialMetrics,
+                    platform: 'tiktok',
+                    autoQualified: true,
+                    timestamp: Date.now(),
+                    eventType: 'migration',
+                    timer: timer
+                });
+
+                const totalPreProcessTime = Date.now() - startTime;
+                logger.info(`🎵 [${timer.operationId}] TikTok migration auto-qualified in ${totalPreProcessTime}ms (queue size: ${this.processingQueue.length})`);
                 return;
             }
 
-            logger.info(`✅ [${timer.operationId}] Twitter validation complete in ${twitterValidationTime}ms: ${quickMetrics.likes} likes`);
+            // 🐦 Twitter Engagement Check Path
+            if (platform === 'twitter') {
+                logger.info(`📱 [${timer.operationId}] Twitter link found in ${socialValidationTime}ms: ${socialUrl}`);
 
-            // STEP 3: Check likes threshold
-            if (quickMetrics.likes < this.config.minTwitterLikes) {
-                logger.info(`❌ [${timer.operationId}] ${tokenInfo.symbol} has ${quickMetrics.likes} likes (< ${this.config.minTwitterLikes}), skipping`);
-                this.stats.likesThresholdFailed++;
-                this.stats.migrationsSkipped++;
-                return;
+                if (!socialMetrics || !socialMetrics.likes) {
+                    logger.warn(`❌ [${timer.operationId}] Twitter validation failed`);
+                    this.stats.socialMediaValidationFailed++; // ✅ FIXED: Consistent variable name
+                    this.stats.migrationsSkipped++;
+                    return;
+                }
+
+                logger.info(`✅ [${timer.operationId}] Twitter validation complete: ${socialMetrics.likes} likes`);
+
+                // STEP 3: Check likes threshold for Twitter
+                if (socialMetrics.likes < this.config.minTwitterLikes) {
+                    logger.info(`❌ [${timer.operationId}] ${tokenInfo.symbol} has ${socialMetrics.likes} likes (< ${this.config.minTwitterLikes}), skipping`);
+                    this.stats.likesThresholdFailed++;
+                    this.stats.migrationsSkipped++;
+                    return;
+                }
+
+                // 🚀 Twitter QUALIFIED! Add to processing queue
+                logger.info(`🚀 [${timer.operationId}] ${tokenInfo.symbol} qualified with ${socialMetrics.likes} Twitter likes! Adding to analysis queue...`);
+                this.stats.twitterQualified++;
+
+                const completeTokenEvent = {
+                    ...migrationEvent,
+                    eventType: 'migration',
+                    name: tokenInfo.name,
+                    symbol: tokenInfo.symbol,
+                    timer: timer,
+                    tokenInfo: tokenInfo
+                };
+
+                this.processingQueue.push({
+                    tokenEvent: completeTokenEvent,
+                    socialUrl,
+                    socialMetrics,
+                    platform: 'twitter',
+                    autoQualified: false,
+                    timestamp: Date.now(),
+                    eventType: 'migration',
+                    timer: timer
+                });
+
+                const totalPreProcessTime = Date.now() - startTime;
+                logger.info(`📊 [${timer.operationId}] Twitter-qualified migration added to queue in ${totalPreProcessTime}ms (queue size: ${this.processingQueue.length})`);
             }
-
-            // 🚀 QUALIFIED! Add to processing queue
-            logger.info(`🚀 [${timer.operationId}] ${tokenInfo.symbol} QUALIFIED with ${quickMetrics.likes} likes! Adding to analysis queue...`);
-
-            const completeTokenEvent = {
-                ...migrationEvent,
-                eventType: 'migration',
-                name: tokenInfo.name,
-                symbol: tokenInfo.symbol,
-                timer: timer,
-                tokenInfo: tokenInfo
-            };
-
-            this.processingQueue.push({
-                tokenEvent: completeTokenEvent,
-                twitterUrl,
-                quickMetrics,
-                timestamp: Date.now(),
-                eventType: 'migration',
-                timer: timer
-            });
-
-            const totalPreProcessTime = Date.now() - startTime;
-            logger.info(`📊 [${timer.operationId}] Qualified migration added to queue in ${totalPreProcessTime}ms (queue size: ${this.processingQueue.length})`);
 
         } catch (error) {
             const totalTime = Date.now() - startTime;
@@ -185,13 +231,16 @@ class MigrationMonitor extends EventEmitter {
     }
 
     async processQueueItem(item) {
-        const { tokenEvent, twitterUrl, quickMetrics, timestamp, eventType, timer } = item;
+        const { tokenEvent, socialUrl, socialMetrics, platform, autoQualified, timestamp, eventType, timer } = item;
         const operationId = timer?.operationId || `${tokenEvent.symbol}_${eventType}_${Date.now()}`;
         const processingStart = Date.now();
 
         try {
             this.stats.migrationsProcessed++;
-            logger.info(`🔄 [${operationId}] Processing QUALIFIED migration: ${tokenEvent.symbol} (${quickMetrics.likes} likes)`);
+            const platformEmoji = platform === 'tiktok' ? '🎵' : '📱';
+            const qualificationStatus = autoQualified ? 'AUTO-QUALIFIED' : 'QUALIFIED';
+            
+            logger.info(`🔄 [${operationId}] Processing ${qualificationStatus} migration: ${tokenEvent.symbol} (${platformEmoji} ${platform.toUpperCase()})`);
 
             // Check if item is too old
             const queueAge = Date.now() - timestamp;
@@ -216,13 +265,15 @@ class MigrationMonitor extends EventEmitter {
                 
                 const parallelPromises = [];
                 
-                // Promise 1: View extraction (if enabled) using TwitterValidator
-                if (this.config.enableViewCountExtraction) {
-                    parallelPromises.push(this.extractViewsParallel(twitterUrl, operationId));
+                // Promise 1: View extraction (only for Twitter, TikTok skips this)
+                if (platform === 'twitter' && this.config.enableViewCountExtraction) {
+                    parallelPromises.push(this.extractViewsParallel(socialUrl, operationId));
+                } else if (platform === 'tiktok') {
+                    logger.info(`[${operationId}] 🎵 TikTok - skipping view extraction (auto-qualified)`);
                 }
                 
                 // Promise 2: Analysis (always runs)
-                parallelPromises.push(this.runAnalysisParallel(tokenEvent, quickMetrics, operationId, timer));
+                parallelPromises.push(this.runAnalysisParallel(tokenEvent, socialMetrics, operationId, timer));
                 
                 // Execute truly in parallel
                 const results = await Promise.allSettled(parallelPromises);
@@ -232,8 +283,8 @@ class MigrationMonitor extends EventEmitter {
                 let analysisResult = null;
                 let viewExtractionTime = 0;
                 
-                if (this.config.enableViewCountExtraction) {
-                    // Views + Analysis
+                if (platform === 'twitter' && this.config.enableViewCountExtraction) {
+                    // Views + Analysis for Twitter
                     const viewResult = results[0];
                     const analysisResultData = results[1];
                     
@@ -247,7 +298,7 @@ class MigrationMonitor extends EventEmitter {
                         analysisResult = analysisResultData.value.analysisResult;
                     }
                 } else {
-                    // Analysis only
+                    // Analysis only (TikTok path or Twitter without view extraction)
                     const analysisResultData = results[0];
                     if (analysisResultData.status === 'fulfilled') {
                         analysisResult = analysisResultData.value.analysisResult;
@@ -260,23 +311,27 @@ class MigrationMonitor extends EventEmitter {
                     return;
                 }
                 
-                // 🔥 OPTIMIZED: Create final metrics
-                const finalTwitterMetrics = {
-                    link: twitterUrl,
-                    likes: quickMetrics.likes,
-                    views: viewMetrics?.views || 0,
+                // Create final metrics
+                const finalSocialMetrics = {
+                    link: socialUrl,
+                    platform: platform,
+                    likes: socialMetrics.likes,
+                    views: viewMetrics?.views || socialMetrics.views || 0,
                     retweets: 0,
                     replies: 0,
-                    publishedAt: quickMetrics.publishedAt
+                    publishedAt: socialMetrics.publishedAt,
+                    autoQualified: autoQualified,
+                    qualificationReason: autoQualified ? `${platform} link detected - auto-qualified` : 'Engagement threshold met'
                 };
                 
                 const totalProcessingTime = Date.now() - processingStart;
                 
                 // Publish results
-                await this.publishCompletedAnalysis(tokenEvent, finalTwitterMetrics, analysisResult, operationId, timer);
+                await this.publishCompletedAnalysis(tokenEvent, finalSocialMetrics, analysisResult, operationId, timer);
                 
+                const platformSymbol = platform === 'tiktok' ? '🎵' : '📱';
                 logger.info(`✅ [${operationId}] Migration completed in ${totalProcessingTime}ms`);
-                logger.info(`📊 [${operationId}] Final: ${finalTwitterMetrics.views} views, ${finalTwitterMetrics.likes} likes`);
+                logger.info(`📊 [${operationId}] Final: ${finalSocialMetrics.views} views, ${finalSocialMetrics.likes} likes (${platformSymbol} ${platform.toUpperCase()})`);
                 
                 this.stats.analysesCompleted++;
 
@@ -291,12 +346,11 @@ class MigrationMonitor extends EventEmitter {
         }
     }
 
-    // 🔥 OPTIMIZED: Use TwitterValidator directly for views
-    async extractViewsParallel(twitterUrl, operationId) {
+    // Use SocialMediaManager for view extraction
+    async extractViewsParallel(socialUrl, operationId) {
         const start = Date.now();
         try {
-            const tweetId = this.twitterValidator.extractTweetId(twitterUrl);
-            const viewMetrics = await this.twitterValidator.getViewsFromPage(tweetId);
+            const viewMetrics = await this.socialMediaManager.validateEngagementForPlatform(socialUrl, 'twitter');
             const duration = Date.now() - start;
             
             logger.debug(`[${operationId}] View extraction: ${viewMetrics?.views || 'failed'} (${duration}ms)`);
@@ -308,7 +362,7 @@ class MigrationMonitor extends EventEmitter {
         }
     }
 
-    async runAnalysisParallel(tokenEvent, quickMetrics, operationId, timer) {
+    async runAnalysisParallel(tokenEvent, socialMetrics, operationId, timer) {
         const start = Date.now();
         try {
             const analysisResult = await this.analysisOrchestrator.analyzeToken({
@@ -320,7 +374,7 @@ class MigrationMonitor extends EventEmitter {
                     address: tokenEvent.mint,
                     eventType: 'migration'
                 },
-                twitterMetrics: quickMetrics,
+                twitterMetrics: socialMetrics, // Keep name for compatibility
                 operationId,
                 timer
             });
@@ -335,7 +389,7 @@ class MigrationMonitor extends EventEmitter {
         }
     }
 
-    async publishCompletedAnalysis(tokenEvent, finalTwitterMetrics, analysisResult, operationId, timer) {
+    async publishCompletedAnalysis(tokenEvent, finalSocialMetrics, analysisResult, operationId, timer) {
         try {
             const completeAnalysisResult = {
                 ...analysisResult,
@@ -346,17 +400,22 @@ class MigrationMonitor extends EventEmitter {
                     address: tokenEvent.mint,
                     eventType: 'migration'
                 },
-                twitterMetrics: finalTwitterMetrics,
+                twitterMetrics: finalSocialMetrics, // Keep for compatibility
+                socialMetrics: finalSocialMetrics,   // New field
                 operationId,
                 timer
             };
 
             await this.telegramPublisher.publishAnalysis(completeAnalysisResult);
-            logger.info(`📤 [${operationId}] Published to Telegram`);
+            const platformEmoji = finalSocialMetrics.platform === 'tiktok' ? '🎵' : '📱';
+            logger.info(`📤 [${operationId}] Published to Telegram (${platformEmoji} ${finalSocialMetrics.platform.toUpperCase()})`);
 
             this.emit('analysisCompleted', {
                 tokenEvent,
-                twitterMetrics: finalTwitterMetrics,
+                twitterMetrics: finalSocialMetrics, // Keep for compatibility
+                socialMetrics: finalSocialMetrics,   // New field
+                platform: finalSocialMetrics.platform,
+                autoQualified: finalSocialMetrics.autoQualified,
                 analysisResult,
                 operationId
             });
@@ -366,9 +425,6 @@ class MigrationMonitor extends EventEmitter {
             this.stats.errors++;
         }
     }
-
-    // 🔥 REMOVED: All duplicate Twitter URL extraction methods
-    // TwitterValidator now handles everything
 
     startQueueProcessor() {
         setInterval(async () => {
@@ -415,7 +471,7 @@ class MigrationMonitor extends EventEmitter {
         const cleanup = async () => {
             logger.info('🧹 Cleaning up MigrationMonitor resources...');
             try {
-                await this.twitterValidator.cleanup();
+                await this.socialMediaManager.cleanup();
                 logger.info('✅ MigrationMonitor cleanup completed');
             } catch (error) {
                 logger.error('❌ Error during cleanup:', error);
@@ -439,7 +495,8 @@ class MigrationMonitor extends EventEmitter {
             config: {
                 minTwitterLikes: this.config.minTwitterLikes,
                 enableViewCountExtraction: this.config.enableViewCountExtraction,
-                viewCountTimeout: this.config.viewCountTimeout
+                viewCountTimeout: this.config.viewCountTimeout,
+                tiktokAutoQualification: true // ✅ ADDED: Show TikTok support
             }
         };
     }
@@ -457,16 +514,18 @@ class MigrationMonitor extends EventEmitter {
             migrationsProcessed, 
             analysesCompleted, 
             migrationsSkipped, 
-            twitterValidationFailed,
+            tiktokAutoQualified,
+            twitterQualified,
+            socialMediaValidationFailed, // ✅ FIXED: Consistent variable name
             likesThresholdFailed,
             viewCountsExtracted,
             errors 
         } = this.stats;
         
         const successRate = migrationsReceived > 0 ? ((analysesCompleted / migrationsReceived) * 100).toFixed(1) : 0;
-        const viewRate = analysesCompleted > 0 ? ((viewCountsExtracted / analysesCompleted) * 100).toFixed(1) : 0;
+        const viewRate = twitterQualified > 0 ? ((viewCountsExtracted / twitterQualified) * 100).toFixed(1) : 0;
         
-        return `📊 Migration Stats: ${migrationsReceived} received | ${analysesCompleted} analyzed | ${migrationsSkipped} skipped (${twitterValidationFailed} Twitter fails, ${likesThresholdFailed} likes fails) | ${viewCountsExtracted} views (${viewRate}%) | ${errors} errors | ${successRate}% success`;
+        return `📊 Migration Stats: ${migrationsReceived} received | ${analysesCompleted} analyzed (🎵 ${tiktokAutoQualified} TikTok + 📱 ${twitterQualified} Twitter) | ${migrationsSkipped} skipped (${socialMediaValidationFailed} social fails, ${likesThresholdFailed} likes fails) | ${viewCountsExtracted} views (${viewRate}%) | ${errors} errors | ${successRate}% success`;
     }
 
     resetStats() {
@@ -475,7 +534,9 @@ class MigrationMonitor extends EventEmitter {
             migrationsProcessed: 0,
             analysesCompleted: 0,
             migrationsSkipped: 0,
-            twitterValidationFailed: 0,
+            tiktokAutoQualified: 0,        // ✅ ADDED: Include TikTok stats
+            twitterQualified: 0,           // ✅ ADDED: Include Twitter stats
+            socialMediaValidationFailed: 0, // ✅ FIXED: Consistent variable name
             likesThresholdFailed: 0,
             viewCountsExtracted: 0,
             metadataFetchFailures: 0,
@@ -487,7 +548,7 @@ class MigrationMonitor extends EventEmitter {
     async cleanup() {
         logger.info('🧹 Cleaning up MigrationMonitor...');
         try {
-            await this.twitterValidator.cleanup();
+            await this.socialMediaManager.cleanup();
             logger.info('✅ MigrationMonitor cleanup completed');
         } catch (error) {
             logger.error('❌ Error during cleanup:', error);

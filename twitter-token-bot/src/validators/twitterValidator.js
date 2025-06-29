@@ -1,4 +1,4 @@
-// Cleaned TwitterValidator - Only fast likes + puppeteer views with SIMPLE views detection
+// src/validators/twitterValidator.js - Clean Twitter-only validator
 const axios = require('axios');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -11,6 +11,7 @@ class TwitterValidator {
         this.config = {
             quickTimeout: config.quickTimeout || 5000,
             enablePageExtraction: config.enablePageExtraction !== false,
+            timeout: config.timeout || 30000,
             ...config
         };
 
@@ -24,99 +25,9 @@ class TwitterValidator {
     }
 
     /**
-     * Extract Twitter status URL from token event
-     */
-    async extractTwitterUrl(tokenEvent) {
-        // Check direct fields first
-        const possibleFields = ['twitter', 'social', 'socials'];
-        
-        for (const field of possibleFields) {
-            if (tokenEvent[field]) {
-                const statusUrl = this.findTwitterStatusUrl(tokenEvent[field]);
-                if (statusUrl) return statusUrl;
-            }
-        }
-
-        // Check metadata URI
-        if (tokenEvent.uri) {
-            return await this.extractFromMetadataUri(tokenEvent.uri);
-        }
-
-        return null;
-    }
-
-    findTwitterStatusUrl(text) {
-        if (!text || typeof text !== 'string') return null;
-        
-        const statusPatterns = [
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi
-        ];
-
-        for (const pattern of statusPatterns) {
-            const matches = text.match(pattern);
-            if (matches) return matches[0];
-        }
-        
-        return null;
-    }
-
-    async extractFromMetadataUri(uri) {
-        try {
-            let fetchUrl = uri;
-            if (uri.startsWith('ipfs://')) {
-                fetchUrl = uri.replace('ipfs://', 'https://ipfs.io/ipfs/');
-            } else if (uri.startsWith('ar://')) {
-                fetchUrl = uri.replace('ar://', 'https://arweave.net/');
-            }
-            
-            const response = await axios.get(fetchUrl, { 
-                timeout: 10000,
-                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TokenScanner/1.0)' }
-            });
-            
-            if (response.data) {
-                return this.findTwitterStatusInMetadata(response.data);
-            }
-            return null;
-            
-        } catch (error) {
-            logger.debug(`Failed to fetch metadata from ${uri}: ${error.message}`);
-            return null;
-        }
-    }
-
-    findTwitterStatusInMetadata(metadata) {
-        const statusPatterns = [
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/gi,
-            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/gi
-        ];
-        
-        const fieldsToCheck = ['twitter', 'social', 'socials', 'links', 'external_url', 'description'];
-        
-        // Check specific fields first
-        for (const field of fieldsToCheck) {
-            if (metadata[field]) {
-                const fieldStr = JSON.stringify(metadata[field]);
-                for (const pattern of statusPatterns) {
-                    const matches = fieldStr.match(pattern);
-                    if (matches) return matches[0];
-                }
-            }
-        }
-        
-        // Check entire metadata as fallback
-        const metadataStr = JSON.stringify(metadata);
-        for (const pattern of statusPatterns) {
-            const matches = metadataStr.match(pattern);
-            if (matches) return matches[0];
-        }
-        
-        return null;
-    }
-
-    /**
-     * Fast likes check using syndication API
+     * Quick likes check using Twitter syndication API
+     * @param {string} twitterUrl - Twitter status URL
+     * @returns {Object|null} - Engagement metrics or null
      */
     async quickLikesCheck(twitterUrl) {
         if (!twitterUrl) return null;
@@ -140,6 +51,7 @@ class TwitterValidator {
                 if (likes > 0) {
                     return {
                         link: twitterUrl,
+                        platform: 'twitter',
                         likes: likes,
                         publishedAt: this.parseTwitterDate(response.data.created_at || response.data.created_time),
                         views: 0,
@@ -158,6 +70,8 @@ class TwitterValidator {
 
     /**
      * Full validation with views using puppeteer
+     * @param {string} twitterUrl - Twitter status URL
+     * @returns {Object|null} - Full engagement metrics or null
      */
     async validateEngagement(twitterUrl) {
         if (!twitterUrl) return null;
@@ -176,6 +90,7 @@ class TwitterValidator {
                     // Combine: views from page + likes from quickMetrics
                     return {
                         link: twitterUrl,
+                        platform: 'twitter',
                         views: pageMetrics.views,
                         likes: quickMetrics?.likes || 0,
                         retweets: 0,
@@ -188,6 +103,7 @@ class TwitterValidator {
             // Fallback to just likes
             return quickMetrics || {
                 link: twitterUrl,
+                platform: 'twitter',
                 views: 0,
                 likes: 0,
                 retweets: 0,
@@ -196,9 +112,10 @@ class TwitterValidator {
             };
 
         } catch (error) {
-            logger.debug(`Validation failed for ${tweetId}: ${error.message}`);
+            logger.debug(`Twitter validation failed for ${tweetId}: ${error.message}`);
             return {
                 link: twitterUrl,
+                platform: 'twitter',
                 views: 0,
                 likes: 0,
                 retweets: 0,
@@ -209,7 +126,9 @@ class TwitterValidator {
     }
 
     /**
-     * Get views from page - EXACTLY like your test script
+     * Get views from page using puppeteer
+     * @param {string} tweetId - Tweet ID
+     * @returns {Object|null} - Views data or null
      */
     async getViewsFromPage(tweetId) {
         if (!this.browser) {
@@ -224,7 +143,7 @@ class TwitterValidator {
         try {
             await page.goto(`https://twitter.com/i/status/${tweetId}`, { 
                 waitUntil: 'domcontentloaded', 
-                timeout: 30000 
+                timeout: this.config.timeout 
             });
 
             await new Promise(resolve => setTimeout(resolve, 3000));
@@ -262,6 +181,8 @@ class TwitterValidator {
 
     /**
      * Parse number from text like "6,146 Views"
+     * @param {string} str - Text containing number
+     * @returns {number} - Parsed number
      */
     parseNumber(str) {
         if (!str || typeof str !== 'string') return 0;
@@ -273,6 +194,11 @@ class TwitterValidator {
         return parseInt(number.replace(/,/g, '')) || 0;
     }
 
+    /**
+     * Extract tweet ID from Twitter URL
+     * @param {string} url - Twitter URL
+     * @returns {string|null} - Tweet ID or null
+     */
     extractTweetId(url) {
         const patterns = [
             /(?:twitter\.com|x\.com)\/[\w]+\/status\/(\d+)/,
@@ -288,6 +214,11 @@ class TwitterValidator {
         return null;
     }
 
+    /**
+     * Parse Twitter date string
+     * @param {string|number} dateString - Date from Twitter API
+     * @returns {string|null} - ISO date string or null
+     */
     parseTwitterDate(dateString) {
         if (!dateString) return null;
         
@@ -301,6 +232,33 @@ class TwitterValidator {
         }
     }
 
+    /**
+     * Validate if URL is a Twitter status URL
+     * @param {string} url - URL to validate
+     * @returns {boolean} - Is valid Twitter URL
+     */
+    isValidTwitterUrl(url) {
+        if (!url || typeof url !== 'string') return false;
+        
+        const patterns = [
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/\d+/i,
+            /https?:\/\/(www\.)?(twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/statuses\/\d+/i
+        ];
+
+        return patterns.some(pattern => pattern.test(url));
+    }
+
+    /**
+     * Get configuration
+     * @returns {Object} - Current configuration
+     */
+    getConfig() {
+        return { ...this.config };
+    }
+
+    /**
+     * Clean up resources
+     */
     async cleanup() {
         if (this.browser) {
             await this.browser.close();

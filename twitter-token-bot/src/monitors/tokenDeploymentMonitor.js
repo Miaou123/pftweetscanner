@@ -1,7 +1,7 @@
-// src/monitors/tokenDeploymentMonitor.js - Streamlined using TwitterValidator
+// src/monitors/tokenDeploymentMonitor.js - CORRECTED VERSION
 const EventEmitter = require('events');
 const logger = require('../utils/logger');
-const TwitterValidator = require('../validators/twitterValidator');
+const SocialMediaManager = require('../validators/socialMediaManager');
 const AnalysisOrchestrator = require('../orchestrators/analysisOrchestrator');
 const { getSolanaApi } = require('../integrations/solanaApi');
 
@@ -23,12 +23,13 @@ class TokenDeploymentMonitor extends EventEmitter {
         logger.info(`📋 TokenDeploymentMonitor Config:`);
         logger.info(`   • Min Twitter Views: ${this.config.minTwitterViews.toLocaleString()}`);
         logger.info(`   • Min Twitter Likes: ${this.config.minTwitterLikes.toLocaleString()}`);
+        logger.info(`   • 🎵 TikTok Auto-Qualification: Enabled`);
         logger.info(`   • View Count Extraction: ${this.config.enableViewCountExtraction ? 'Enabled' : 'Disabled'}`);
 
-        // Single TwitterValidator instance
-        this.twitterValidator = new TwitterValidator({
-            enablePageExtraction: this.config.enableViewCountExtraction,
-            timeout: this.config.viewCountTimeout,
+        // Use SocialMediaManager instead of TwitterValidator
+        this.socialMediaManager = new SocialMediaManager({
+            enableViewCountExtraction: this.config.enableViewCountExtraction,
+            viewCountTimeout: this.config.viewCountTimeout,
             quickTimeout: 3000
         });
         
@@ -45,14 +46,16 @@ class TokenDeploymentMonitor extends EventEmitter {
         this.currentlyAnalyzing = new Set();
         this.isProcessing = false;
         
-        // Performance stats
+        // Enhanced stats with TikTok tracking
         this.stats = {
             tokensReceived: 0,
             tokensProcessed: 0,
             tokensSkipped: 0,
             tokensAnalyzed: 0,
+            tiktokAutoQualified: 0,
+            twitterQualified: 0,
             viewCountsExtracted: 0,
-            twitterFailures: 0,
+            socialMediaFailures: 0, // ✅ FIXED: Used consistently
             errors: 0
         };
 
@@ -89,27 +92,78 @@ class TokenDeploymentMonitor extends EventEmitter {
 
             this.processedTokens.add(tokenEvent.mint);
 
-            // Extract Twitter URL using TwitterValidator
-            const twitterUrl = await this.twitterValidator.extractTwitterUrl(tokenEvent);
+            // Use SocialMediaManager for extraction and quick check
+            const socialResult = await this.socialMediaManager.quickEngagementCheck(tokenEvent);
 
-            if (!twitterUrl) {
-                logger.debug(`No valid tweet status URL found for ${tokenEvent.symbol}`);
+            if (!socialResult) {
+                logger.debug(`No valid social URL found for ${tokenEvent.symbol}`);
                 this.stats.tokensSkipped++;
                 return;
             }
 
-            logger.info(`📱 Valid tweet found for ${tokenEvent.symbol}: ${twitterUrl}`);
+            const { url: socialUrl, platform, metrics: socialMetrics, autoQualified } = socialResult;
 
-            // Add to processing queue
-            this.processingQueue.push({
-                tokenEvent,
-                twitterUrl,
-                timestamp: Date.now(),
-                timer
-            });
+            // 🎵 TikTok Auto-Qualification Path
+            if (platform === 'tiktok') {
+                logger.info(`🎵 TikTok link detected for ${tokenEvent.symbol}: ${socialUrl}`);
+                logger.info(`🚀 AUTO-QUALIFYING ${tokenEvent.symbol} - TikTok has viral potential!`);
+                
+                this.stats.tiktokAutoQualified++;
+                
+                // Add to processing queue immediately
+                this.processingQueue.push({
+                    tokenEvent,
+                    socialUrl,
+                    socialMetrics,
+                    platform: 'tiktok',
+                    autoQualified: true,
+                    timestamp: Date.now(),
+                    timer
+                });
 
-            this.stats.tokensProcessed++;
-            logger.debug(`Queued ${tokenEvent.symbol}. Queue size: ${this.processingQueue.length}`);
+                this.stats.tokensProcessed++;
+                logger.info(`🎵 ${tokenEvent.symbol} queued for analysis with TikTok auto-qualification. Queue size: ${this.processingQueue.length}`);
+                return;
+            }
+
+            // 🐦 Twitter Engagement Check Path
+            if (platform === 'twitter') {
+                logger.info(`📱 Twitter link found for ${tokenEvent.symbol}: ${socialUrl}`);
+
+                if (!socialMetrics || !socialMetrics.likes) {
+                    logger.info(`❌ Twitter validation failed for ${tokenEvent.symbol}`);
+                    this.stats.socialMediaFailures++; // ✅ FIXED: Using consistent variable
+                    this.stats.tokensSkipped++;
+                    return;
+                }
+
+                logger.info(`⚡ ${socialMetrics.likes} likes found for ${tokenEvent.symbol}`);
+
+                // Check engagement threshold for Twitter
+                if (socialMetrics.likes < this.config.minTwitterLikes) {
+                    logger.info(`❌ ${tokenEvent.symbol} has ${socialMetrics.likes} likes (< ${this.config.minTwitterLikes}), skipping`);
+                    this.stats.tokensSkipped++;
+                    return;
+                }
+
+                // Twitter qualified!
+                logger.info(`🚀 ${tokenEvent.symbol} qualified with ${socialMetrics.likes} Twitter likes! Starting analysis...`);
+                this.stats.twitterQualified++;
+
+                // Add to processing queue
+                this.processingQueue.push({
+                    tokenEvent,
+                    socialUrl,
+                    socialMetrics,
+                    platform: 'twitter',
+                    autoQualified: false,
+                    timestamp: Date.now(),
+                    timer
+                });
+
+                this.stats.tokensProcessed++;
+                logger.debug(`Twitter-qualified ${tokenEvent.symbol} queued. Queue size: ${this.processingQueue.length}`);
+            }
 
         } catch (error) {
             logger.error(`Error processing new token ${tokenEvent.mint}:`, error);
@@ -118,11 +172,11 @@ class TokenDeploymentMonitor extends EventEmitter {
     }
 
     async processQueueItem(item) {
-        const { tokenEvent, twitterUrl, timestamp, timer } = item;
+        const { tokenEvent, socialUrl, socialMetrics, platform, autoQualified, timestamp, timer } = item;
         const operationId = timer.operationId;
 
         try {
-            logger.info(`🔄 [${operationId}] Processing: ${tokenEvent.symbol}`);
+            logger.info(`🔄 [${operationId}] Processing: ${tokenEvent.symbol} (${platform.toUpperCase()}${autoQualified ? ' - AUTO-QUALIFIED' : ''})`);
 
             // Check if item is too old (10 minutes)
             if (Date.now() - timestamp > 10 * 60 * 1000) {
@@ -131,116 +185,92 @@ class TokenDeploymentMonitor extends EventEmitter {
                 return;
             }
 
-            // STEP 1: Quick likes check
-            logger.debug(`[${operationId}] 🚀 Quick likes check: ${twitterUrl}`);
-            const quickMetrics = await this.twitterValidator.quickLikesCheck(twitterUrl);
-
-            if (!quickMetrics || !quickMetrics.likes) {
-                logger.info(`[${operationId}] Twitter validation failed for ${tokenEvent.symbol}`);
-                this.stats.twitterFailures++;
+            // Check concurrent limit
+            if (this.currentlyAnalyzing.size >= this.config.maxConcurrentAnalyses) {
+                logger.warn(`[${operationId}] Max concurrent analyses reached, requeuing`);
+                setTimeout(() => {
+                    this.processingQueue.unshift(item);
+                }, 30000);
                 return;
             }
 
-            logger.info(`[${operationId}] ⚡ ${quickMetrics.likes} likes found`);
+            this.currentlyAnalyzing.add(tokenEvent.mint);
 
-            // STEP 2: Check engagement threshold
-            if (quickMetrics.likes < this.config.minTwitterLikes) {
-                logger.info(`[${operationId}] ${tokenEvent.symbol} has ${quickMetrics.likes} likes (< ${this.config.minTwitterLikes}), skipping`);
-                this.stats.tokensSkipped++;
-                return;
-            }
+            try {
+                let finalSocialMetrics = socialMetrics;
 
-            // STEP 3: QUALIFIED! Run expensive operations
-            logger.info(`🚀 [${operationId}] ${tokenEvent.symbol} qualified with ${quickMetrics.likes} likes! Starting analysis...`);
-            await this.runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer);
-
-        } catch (error) {
-            logger.error(`[${operationId}] Error processing queue item:`, error);
-            this.stats.errors++;
-        }
-    }
-
-    async runQualifiedAnalysis(tokenEvent, twitterUrl, quickMetrics, operationId, timer) {
-        // Check concurrent limit
-        if (this.currentlyAnalyzing.size >= this.config.maxConcurrentAnalyses) {
-            logger.warn(`[${operationId}] Max concurrent analyses reached, requeuing`);
-            setTimeout(() => {
-                this.processingQueue.unshift({ 
-                    tokenEvent, 
-                    twitterUrl, 
-                    timestamp: Date.now(),
-                    timer 
-                });
-            }, 30000);
-            return;
-        }
-
-        this.currentlyAnalyzing.add(tokenEvent.mint);
-
-        try {
-            let finalTwitterMetrics = quickMetrics;
-
-            // Get full metrics including views if enabled
-            if (this.config.enableViewCountExtraction) {
-                logger.info(`[${operationId}] 📊 Extracting view count...`);
-                try {
-                    const viewStart = Date.now();
-                    const fullMetrics = await this.twitterValidator.validateEngagement(twitterUrl);
-                    const viewTime = Date.now() - viewStart;
-                    
-                    if (fullMetrics && (fullMetrics.views > 0 || fullMetrics.likes > quickMetrics.likes)) {
-                        finalTwitterMetrics = fullMetrics;
-                        this.stats.viewCountsExtracted++;
-                        logger.info(`[${operationId}] ✅ Views extracted (${viewTime}ms): ${finalTwitterMetrics.views} views, ${finalTwitterMetrics.likes} likes`);
-                    } else {
-                        logger.warn(`[${operationId}] ⚠️ View extraction failed (${viewTime}ms)`);
-                    }
-                } catch (error) {
-                    logger.warn(`[${operationId}] ⚠️ View extraction error: ${error.message}`);
+                // 🎵 TikTok: Skip expensive operations, already auto-qualified
+                if (platform === 'tiktok') {
+                    logger.info(`[${operationId}] 🎵 TikTok link - skipping engagement extraction, using auto-qualified metrics`);
                 }
-            }
+                // 🐦 Twitter: Get full metrics including views if enabled
+                else if (platform === 'twitter' && this.config.enableViewCountExtraction) {
+                    logger.info(`[${operationId}] 📊 Extracting Twitter view count...`);
+                    try {
+                        const viewStart = Date.now();
+                        // Use SocialMediaManager for full validation
+                        const fullMetrics = await this.socialMediaManager.validateEngagementForPlatform(socialUrl, 'twitter');
+                        const viewTime = Date.now() - viewStart;
+                        
+                        if (fullMetrics && (fullMetrics.views > 0 || fullMetrics.likes > socialMetrics.likes)) {
+                            finalSocialMetrics = fullMetrics;
+                            this.stats.viewCountsExtracted++;
+                            logger.info(`[${operationId}] ✅ Views extracted (${viewTime}ms): ${finalSocialMetrics.views} views, ${finalSocialMetrics.likes} likes`);
+                        } else {
+                            logger.warn(`[${operationId}] ⚠️ View extraction failed (${viewTime}ms)`);
+                        }
+                    } catch (error) {
+                        logger.warn(`[${operationId}] ⚠️ View extraction error: ${error.message}`);
+                    }
+                }
 
-            // Run token analysis
-            logger.info(`[${operationId}] 🔬 Running token analysis...`);
-            const analysisStart = Date.now();
-            
-            const analysisResult = await this.analysisOrchestrator.analyzeToken({
-                tokenAddress: tokenEvent.mint,
-                tokenInfo: {
-                    name: tokenEvent.name,
-                    symbol: tokenEvent.symbol,
-                    creator: tokenEvent.traderPublicKey || tokenEvent.creator,
-                    address: tokenEvent.mint,
-                    eventType: 'creation'
-                },
-                twitterMetrics: finalTwitterMetrics,
-                operationId,
-                timer
-            });
-            
-            const analysisTime = Date.now() - analysisStart;
-
-            // Handle result
-            if (analysisResult.success) {
-                logger.info(`✅ [${operationId}] Analysis completed (${analysisTime}ms)`);
-                this.stats.tokensAnalyzed++;
+                // Run token analysis
+                logger.info(`[${operationId}] 🔬 Running token analysis...`);
+                const analysisStart = Date.now();
                 
-                this.emit('analysisCompleted', {
-                    tokenEvent,
-                    twitterMetrics: finalTwitterMetrics,
-                    analysisResult,
-                    operationId
+                const analysisResult = await this.analysisOrchestrator.analyzeToken({
+                    tokenAddress: tokenEvent.mint,
+                    tokenInfo: {
+                        name: tokenEvent.name,
+                        symbol: tokenEvent.symbol,
+                        creator: tokenEvent.traderPublicKey || tokenEvent.creator,
+                        address: tokenEvent.mint,
+                        eventType: 'creation'
+                    },
+                    twitterMetrics: finalSocialMetrics, // Keep name for compatibility
+                    operationId,
+                    timer
                 });
-            } else {
-                logger.error(`❌ [${operationId}] Analysis failed: ${analysisResult.error}`);
-                this.stats.errors++;
+                
+                const analysisTime = Date.now() - analysisStart;
+
+                // Handle result
+                if (analysisResult.success) {
+                    const platformEmoji = platform === 'tiktok' ? '🎵' : '🐦';
+                    logger.info(`✅ [${operationId}] Analysis completed (${analysisTime}ms) - ${platformEmoji} ${platform.toUpperCase()}`);
+                    this.stats.tokensAnalyzed++;
+                    
+                    this.emit('analysisCompleted', {
+                        tokenEvent,
+                        twitterMetrics: finalSocialMetrics, // Keep name for compatibility
+                        socialMetrics: finalSocialMetrics,   // New field with platform info
+                        platform,
+                        autoQualified,
+                        analysisResult,
+                        operationId
+                    });
+                } else {
+                    logger.error(`❌ [${operationId}] Analysis failed: ${analysisResult.error}`);
+                    this.stats.errors++;
+                }
+
+            } finally {
+                this.currentlyAnalyzing.delete(tokenEvent.mint);
             }
 
         } catch (error) {
             logger.error(`[${operationId}] Analysis error:`, error);
             this.stats.errors++;
-        } finally {
-            this.currentlyAnalyzing.delete(tokenEvent.mint);
         }
     }
 
@@ -312,7 +342,7 @@ class TokenDeploymentMonitor extends EventEmitter {
         const cleanup = async () => {
             logger.info('🧹 Cleaning up TokenDeploymentMonitor...');
             try {
-                await this.twitterValidator.cleanup();
+                await this.socialMediaManager.cleanup();
                 logger.info('✅ TokenDeploymentMonitor cleanup completed');
             } catch (error) {
                 logger.error('❌ Error during cleanup:', error);
@@ -337,18 +367,29 @@ class TokenDeploymentMonitor extends EventEmitter {
                 minTwitterLikes: this.config.minTwitterLikes,
                 minTwitterViews: this.config.minTwitterViews,
                 enableViewCountExtraction: this.config.enableViewCountExtraction,
-                analysisTimeout: this.config.analysisTimeout
+                analysisTimeout: this.config.analysisTimeout,
+                tiktokAutoQualification: true // ✅ ADDED: Show TikTok support
             }
         };
     }
 
     getStatsString() {
-        const { tokensReceived, tokensProcessed, tokensAnalyzed, tokensSkipped, twitterFailures, viewCountsExtracted, errors } = this.stats;
-        const successRate = tokensReceived > 0 ? ((tokensAnalyzed / tokensReceived) * 100).toFixed(1) : 0;
-        const twitterSuccessRate = tokensProcessed > 0 ? (((tokensProcessed - twitterFailures) / tokensProcessed) * 100).toFixed(1) : 0;
-        const viewExtractionRate = tokensAnalyzed > 0 ? ((viewCountsExtracted / tokensAnalyzed) * 100).toFixed(1) : 0;
+        const { 
+            tokensReceived, 
+            tokensProcessed, 
+            tokensAnalyzed, 
+            tokensSkipped, 
+            tiktokAutoQualified, 
+            twitterQualified,
+            socialMediaFailures, // ✅ FIXED: Consistent variable name
+            viewCountsExtracted, 
+            errors 
+        } = this.stats;
         
-        return `📊 Creation Stats: ${tokensReceived} received | ${tokensProcessed} processed | ${tokensAnalyzed} analyzed | ${tokensSkipped} skipped | Twitter: ${twitterSuccessRate}% success | Views: ${viewCountsExtracted} (${viewExtractionRate}%) | ${errors} errors | Overall: ${successRate}% success`;
+        const successRate = tokensReceived > 0 ? ((tokensAnalyzed / tokensReceived) * 100).toFixed(1) : 0;
+        const twitterSuccessRate = twitterQualified > 0 ? ((viewCountsExtracted / twitterQualified) * 100).toFixed(1) : 0;
+        
+        return `📊 Creation Stats: ${tokensReceived} received | ${tokensProcessed} processed | ${tokensAnalyzed} analyzed (🎵 ${tiktokAutoQualified} TikTok + 🐦 ${twitterQualified} Twitter) | ${tokensSkipped} skipped | Twitter views: ${viewCountsExtracted} (${twitterSuccessRate}%) | ${errors} errors | Overall: ${successRate}% success`;
     }
 
     resetStats() {
@@ -357,8 +398,10 @@ class TokenDeploymentMonitor extends EventEmitter {
             tokensProcessed: 0,
             tokensSkipped: 0,
             tokensAnalyzed: 0,
+            tiktokAutoQualified: 0, // ✅ ADDED: Include TikTok stats
+            twitterQualified: 0,    // ✅ ADDED: Include Twitter stats
             viewCountsExtracted: 0,
-            twitterFailures: 0,
+            socialMediaFailures: 0, // ✅ FIXED: Consistent variable name
             errors: 0
         };
         logger.info('Statistics reset');

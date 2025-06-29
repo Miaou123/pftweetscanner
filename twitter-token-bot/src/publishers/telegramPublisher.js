@@ -190,12 +190,12 @@ class TelegramPublisher {
             // Whales
             const whaleCount = holders.whaleCount || 0;
             const whaleTokenPercent = holders.whaleTokenPercentage || '0.00';
-            message += `• 🐋 Whales: ${whaleCount}/20 hold ${whaleTokenPercent}% of tokens\n`;
+            message += `• 🐋 Whales: ${whaleCount}/20  (${whaleTokenPercent}%)\n`;
             
             // Fresh wallets
             const freshCount = holders.freshWalletCount || 0;
             const freshTokenPercent = holders.freshWalletTokenPercentage || '0.00';
-            message += `• 🆕 Fresh Wallets: ${freshCount}/20 hold ${freshTokenPercent}% of tokens\n`;
+            message += `• 🆕 Fresh Wallets: ${freshCount}/20 (${freshTokenPercent}%)\n`;
             
             // Top 10 concentration
             if (holders.concentration?.top10Percentage) {

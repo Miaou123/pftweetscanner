@@ -244,6 +244,15 @@ class TopHoldersAnalyzer {
         const top10Holdings = holdingPercentages.slice(0, 10).reduce((sum, pct) => sum + pct, 0);
         const top20Holdings = holdingPercentages.reduce((sum, pct) => sum + pct, 0);
 
+        // Calculate token percentages held by whales and fresh wallets
+        const whaleTokenPercentage = analysisResults
+        .filter(h => h.isWhale)
+        .reduce((sum, h) => sum + parseFloat(h.holdingPercentage || 0), 0);
+
+        const freshWalletTokenPercentage = analysisResults
+            .filter(h => h.isFresh)
+            .reduce((sum, h) => sum + parseFloat(h.holdingPercentage || 0), 0);
+
         // Advanced risk assessment
         const riskScore = this.calculateAdvancedRiskScore(
             whaleCount, 
@@ -267,6 +276,10 @@ class TopHoldersAnalyzer {
             freshWalletCount,
             highValueCount,
             regularWalletCount,
+            whalePercentage: ((whaleCount / totalHolders) * 100).toFixed(1),
+            freshWalletPercentage: ((freshWalletCount / totalHolders) * 100).toFixed(1), 
+            whaleTokenPercentage: whaleTokenPercentage.toFixed(2), 
+            freshWalletTokenPercentage: freshWalletTokenPercentage.toFixed(2), 
             whalePercentage: ((whaleCount / totalHolders) * 100).toFixed(1),
             freshWalletPercentage: ((freshWalletCount / totalHolders) * 100).toFixed(1),
             concentration: {
